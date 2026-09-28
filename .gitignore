@@ -9,3 +9,6 @@ venv/
 
 # IDE
 .vscode/
+
+# Calibración local (generada por simulador/visor.py, distinta por máquina)
+calibracion_control.json

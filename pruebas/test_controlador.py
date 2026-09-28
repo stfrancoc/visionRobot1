@@ -55,6 +55,17 @@ class PruebasControladorPD(unittest.TestCase):
         self.assertIsInstance(izquierda, int)
         self.assertIsInstance(derecha, int)
 
+    def test_dt_cero_no_produce_termino_derivativo_espurio(self):
+        # Con dt=0 (típico en la primera llamada, antes de tener un dt
+        # real) no hay una tasa de cambio confiable: el término
+        # derivativo debe omitirse en vez de dividir por un dt mínimo
+        # artificial, que amplificaría cualquier error pequeño y
+        # saturaría las ruedas de golpe.
+        resultado = ResultadoLinea(error=0.05, angulo=0.0, confianza=4, valida=True)
+        izquierda, derecha = self.controlador.calcular(resultado, dt=0.0)
+        self.assertLess(abs(izquierda), config.VEL_MAX)
+        self.assertLess(abs(derecha), config.VEL_MAX)
+
     def test_detener_da_velocidades_cero(self):
         self.assertEqual(self.controlador.detener(), (0, 0))
 

@@ -31,13 +31,19 @@ class ControladorPD:
             [-VEL_MAX, VEL_MAX].
         Complejidad: O(1).
         """
-        dt_seguro = dt if dt > DT_MINIMO else DT_MINIMO
-
         self.error_suavizado = (
             config.ALFA_SUAVIZADO * resultado_linea.error
             + (1 - config.ALFA_SUAVIZADO) * self.error_suavizado
         )
-        delta_error = (self.error_suavizado - self.error_anterior) / dt_seguro
+
+        # Si dt es cero o casi cero no hay una tasa de cambio confiable
+        # que calcular (dividir por un dt artificialmente pequeño
+        # amplificaría el error y saturaría las ruedas de golpe): en ese
+        # caso se omite el término derivativo en vez de inventarlo.
+        if dt > DT_MINIMO:
+            delta_error = (self.error_suavizado - self.error_anterior) / dt
+        else:
+            delta_error = 0.0
         self.error_anterior = self.error_suavizado
 
         giro = (

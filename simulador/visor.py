@@ -6,20 +6,19 @@ igual que main.py y calibrar.py hacen para la visión real.
 """
 
 import json
-import time
 
 import cv2
 import numpy as np
 
 import config
 from control.estados import MaquinaEstados
+from simulador.metricas_simulacion import RecolectorMetricas
 from simulador.pista_virtual import ANCHO_PISTA, PistaVirtual, crear_pista_calibracion
 
 ANCHO_VENTANA = 900  # Ancho en píxeles de la ventana del visor.
 ALTO_VENTANA = 500  # Alto en píxeles de la ventana del visor.
 MARGEN_VENTANA = 40  # Margen alrededor del área de dibujo de la pista.
 ESCALA_TRACKBAR = 10  # Los trackbars de OpenCV solo dan enteros; se divide por esto para tener decimales.
-DT_SIMULACION = 0.05  # Paso de tiempo fijo de cada iteración del visor (segundos).
 
 RUTA_CALIBRACION = "calibracion_control.json"
 NOMBRE_VENTANA = "Calibracion de control"
@@ -48,6 +47,10 @@ def _crear_trackbars() -> None:
     cv2.createTrackbar("KA", NOMBRE_VENTANA, int(config.KA * ESCALA_TRACKBAR), 2000, lambda _: None)
     cv2.createTrackbar("VEL_BASE", NOMBRE_VENTANA, int(config.VEL_BASE * ESCALA_TRACKBAR), int(config.VEL_MAX * ESCALA_TRACKBAR), lambda _: None)
     cv2.createTrackbar("VEL_MIN", NOMBRE_VENTANA, int(config.VEL_MIN * ESCALA_TRACKBAR), int(config.VEL_MAX * ESCALA_TRACKBAR), lambda _: None)
+    # Solo se lee una vez al arrancar (ver ejecutar_visor): cambiar este
+    # trackbar en plena corrida no reinicia la pista. Para comparar modo
+    # ideal contra realista hay que volver a correr el script.
+    cv2.createTrackbar("modo_ideal (0/1)", NOMBRE_VENTANA, 0, 1, lambda _: None)
 
 
 def _aplicar_trackbars() -> None:
@@ -64,11 +67,21 @@ def _aplicar_trackbars() -> None:
     config.VEL_MIN = _trackbar_a_config("VEL_MIN")
 
 
-def _dibujar_pista(lienzo, pista: PistaVirtual, comando) -> None:
+def _modo_ideal_activo() -> bool:
+    """Lee el trackbar de modo ideal.
+
+    Recibe: nada. Devuelve: bool.
+    Complejidad: O(1).
+    """
+    return cv2.getTrackbarPos("modo_ideal (0/1)", NOMBRE_VENTANA) == 1
+
+
+def _dibujar_pista(lienzo, pista: PistaVirtual, comando, modo_ideal: bool) -> None:
     """Dibuja la pista, el robot, el error y el estado en el lienzo.
 
     Recibe: lienzo (imagen de OpenCV donde dibujar), pista (PistaVirtual
-        con la posición actual) y comando (ComandoRobot del paso actual).
+        con la posición actual), comando (ComandoRobot del paso actual)
+        y modo_ideal (bool, para mostrarlo en el texto).
     Devuelve: nada, dibuja sobre lienzo en el sitio.
     Complejidad: O(1).
     """
@@ -99,10 +112,10 @@ def _dibujar_pista(lienzo, pista: PistaVirtual, comando) -> None:
     cv2.circle(lienzo, (centro_x, y_robot), 10, (0, 140, 255), -1)
 
     tramo = pista.tramo_actual()
-    tipo_tramo = tramo.tipo if tramo is not None else "fin"
+    nombre_tramo = tramo.nombre if tramo is not None else "fin"
 
     textos = [
-        f"tiempo={pista.distancia_total:.1f}  tramo={tipo_tramo}",
+        f"tiempo={pista.tiempo_total:.1f}  tramo={nombre_tramo}  modo_ideal={modo_ideal}",
         f"estado={comando.estado}  accion={comando.accion}",
         f"izq={comando.izquierda}  der={comando.derecha}",
         f"pos_lateral={pista.posicion_lateral:.3f}",
@@ -132,23 +145,30 @@ def _guardar_calibracion() -> None:
     print(f"[Visor] Calibración guardada en {RUTA_CALIBRACION}: {valores}")
 
 
-def _imprimir_metricas(errores: list[float], eventos_fuera: int, tiempo_total: float, estados: set[str]) -> None:
-    """Imprime las métricas finales del recorrido.
+def _imprimir_metricas(recolector: RecolectorMetricas) -> None:
+    """Imprime el resumen de métricas, total y por tramo.
 
-    Recibe: errores (lista de |error| válidos por fotograma), eventos_fuera
-        (veces que el robot se salió de la pista), tiempo_total (segundos
-        simulados) y estados (conjunto de estados visitados).
+    Recibe: recolector (RecolectorMetricas ya alimentado con toda la corrida).
     Devuelve: nada, solo imprime.
-    Complejidad: O(n) sobre la cantidad de errores registrados.
+    Complejidad: O(n) sobre la cantidad de tramos y fotogramas.
     """
-    error_medio = sum(errores) / len(errores) if errores else 0.0
-    error_maximo = max(errores) if errores else 0.0
-    print("\n[Visor] Métricas del recorrido:")
-    print(f"  error medio absoluto: {error_medio:.4f}")
-    print(f"  error máximo: {error_maximo:.4f}")
-    print(f"  veces fuera de la pista: {eventos_fuera}")
-    print(f"  tiempo total simulado: {tiempo_total:.2f} s")
-    print(f"  estados recorridos: {sorted(estados)}")
+
+    def _imprimir_fila(fila: dict) -> None:
+        print(
+            f"  {fila['nombre']:<24} "
+            f"err_medio={fila['error_medio']:.4f}  err_max={fila['error_max']:.4f}  "
+            f"salidas={fila['salidas_de_pista']}  t_fuera={fila['tiempo_fuera_de_pista']:.2f}s  "
+            f"t_detenido={fila['tiempo_detenido_forzado']:.2f}s  "
+            f"oscilacion={fila['oscilacion']:.2f}/s  esfuerzo_medio={fila['esfuerzo_medio']:.2f}  "
+            f"tiempo={fila['tiempo']:.2f}s"
+        )
+
+    print("\n[Visor] Métricas totales:")
+    _imprimir_fila(recolector.resumen_total())
+
+    print("\n[Visor] Métricas por tramo:")
+    for fila in recolector.resumen_por_tramo():
+        _imprimir_fila(fila)
 
 
 def ejecutar_visor() -> None:
@@ -160,12 +180,13 @@ def ejecutar_visor() -> None:
     """
     _crear_trackbars()
 
-    pista = PistaVirtual(crear_pista_calibracion(), ruido=0.01, semilla=None)
+    modo_ideal = _modo_ideal_activo()
+    pista = PistaVirtual(crear_pista_calibracion(), modo_ideal=modo_ideal)
     maquina = MaquinaEstados()
+    recolector = RecolectorMetricas()
     lienzo = None
 
-    errores_absolutos = []
-    estados_visitados = set()
+    dt = config.PASO_SIMULACION_MS / 1000.0
     tiempo_simulado = 0.0
 
     while not pista.terminado():
@@ -174,16 +195,17 @@ def ejecutar_visor() -> None:
         resultado_linea = pista.generar_resultado_linea()
         resultado_senales = pista.generar_resultado_senales()
         comando = maquina.actualizar(resultado_linea, resultado_senales, tiempo_simulado)
-        pista.paso(comando.izquierda, comando.derecha, DT_SIMULACION)
-        tiempo_simulado += DT_SIMULACION
+        pista.paso(comando.izquierda, comando.derecha, dt)
+        tiempo_simulado += dt
 
-        if resultado_linea.valida:
-            errores_absolutos.append(abs(resultado_linea.error))
-        estados_visitados.add(comando.estado)
+        tramo = pista.tramo_actual()
+        nombre_tramo = tramo.nombre if tramo is not None else "fin"
+        error_valido = resultado_linea.error if resultado_linea.valida else None
+        recolector.registrar_paso(nombre_tramo, error_valido, comando.izquierda, comando.derecha, dt, comando.estado)
 
         if lienzo is None:
             lienzo = np.zeros((ALTO_VENTANA, ANCHO_VENTANA, 3), dtype="uint8")
-        _dibujar_pista(lienzo, pista, comando)
+        _dibujar_pista(lienzo, pista, comando, modo_ideal)
         cv2.imshow(NOMBRE_VENTANA, lienzo)
 
         tecla = cv2.waitKey(1) & 0xFF
@@ -192,7 +214,7 @@ def ejecutar_visor() -> None:
         if tecla == ord("g"):
             _guardar_calibracion()
 
-    _imprimir_metricas(errores_absolutos, pista.fuera_de_pista_eventos, tiempo_simulado, estados_visitados)
+    _imprimir_metricas(recolector)
     cv2.destroyAllWindows()
 
 

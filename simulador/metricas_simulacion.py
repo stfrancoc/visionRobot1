@@ -3,11 +3,26 @@
 Lo usan tanto simulador/visor.py (para mostrar el resumen final) como
 simulador/calibrar_ganancias.py (para puntuar combinaciones de
 ganancias), así que la recolección vive en un solo lugar.
+
+Calcular el error medio solo sobre los fotogramas donde valida=True
+premia perder la línea (esos fotogramas simplemente no cuentan), así
+que la métrica principal de salud del sistema es el porcentaje de
+tiempo en cada estado de MaquinaEstados: si la mayor parte del tiempo
+se va en LINEA_PERDIDA/DETENIDO, el "error medio en seguimiento normal"
+puede verse bien y aun así el sistema estar fallando por completo.
 """
 
 from dataclasses import dataclass, field
 
 UMBRAL_OSCILACION = 0.05  # |error| mínimo (en ambos lados del cruce por cero) para contarlo como oscilación real y no como ruido de asentamiento.
+
+# Estados de MaquinaEstados donde el robot está efectivamente siguiendo
+# la línea (o parado a propósito por una señal, lo cual no es una
+# falla): el resto (LINEA_PERDIDA, DETENIDO) cuenta como "fuera de
+# seguimiento" para la métrica de desempeño global.
+ESTADOS_EN_SEGUIMIENTO = frozenset({"SEGUIR_LINEA", "REANUDAR", "SIGA", "PARE"})
+
+PESO_TIEMPO_FUERA_DE_SEGUIMIENTO = 2.0  # Penalización, en la puntuación global, por cada segundo fuera de ESTADOS_EN_SEGUIMIENTO (LINEA_PERDIDA/DETENIDO): el peor desenlace posible.
 
 
 @dataclass
@@ -15,13 +30,17 @@ class MetricasTramo:
     """Métricas acumuladas para un único tramo de la pista.
 
     nombre: etiqueta del tramo (Tramo.nombre).
-    errores: lista de |error| válidos observados durante el tramo.
+    errores: lista de |error| válidos observados durante el tramo,
+        SOLO en fotogramas de seguimiento normal (ver ESTADOS_EN_SEGUIMIENTO).
     tiempo: segundos simulados que duró el tramo.
-    salidas_de_pista: número de veces que |error| > 1 durante el tramo.
-    tiempo_fuera_de_pista: segundos acumulados con |error| > 1.
+    salidas_de_pista: número de veces que |error| > 1 durante el tramo,
+        en fotogramas de seguimiento normal.
+    tiempo_fuera_de_pista: segundos acumulados con |error| > 1, en
+        fotogramas de seguimiento normal.
     cambios_de_signo: número de veces que el error cruzó por cero.
     esfuerzo: lista de |izquierda - derecha| por fotograma, para medir
         cuánto tuvo que corregir el controlador.
+    tiempo_por_estado: segundos acumulados en cada estado de MaquinaEstados.
     """
 
     nombre: str
@@ -32,6 +51,7 @@ class MetricasTramo:
     cambios_de_signo: int = 0
     esfuerzo: list = field(default_factory=list)
     tiempo_detenido_forzado: float = 0.0
+    tiempo_por_estado: dict = field(default_factory=dict)
 
 
 class RecolectorMetricas:
@@ -68,27 +88,33 @@ class RecolectorMetricas:
         izquierda: int,
         derecha: int,
         dt: float,
-        estado: str = "",
+        estado: str,
     ) -> None:
         """Registra un fotograma de simulación en las métricas.
 
         Recibe: nombre_tramo (str), error_valido (float o None si el
             fotograma llegó con valida=False), izquierda, derecha
             (velocidades del comando de este fotograma), dt (segundos) y
-            estado (str opcional, estado de MaquinaEstados en este
-            fotograma; si es "DETENIDO" se acumula como tiempo perdido
-            de forma irrecuperable, distinto de solo "fuera de pista").
+            estado (str, estado de MaquinaEstados en este fotograma:
+            siempre se acumula el tiempo en ese estado, y si es
+            "DETENIDO" además cuenta como tiempo perdido de forma
+            irrecuperable).
         Devuelve: nada.
         Complejidad: O(1).
         """
         tramo = self._obtener_tramo(nombre_tramo)
         tramo.tiempo += dt
         tramo.esfuerzo.append(abs(izquierda - derecha))
+        tramo.tiempo_por_estado[estado] = tramo.tiempo_por_estado.get(estado, 0.0) + dt
 
         if estado == "DETENIDO":
             tramo.tiempo_detenido_forzado += dt
 
-        if error_valido is None:
+        # El error medio, las salidas de pista y su duración solo tienen
+        # sentido en fotogramas de seguimiento normal: un fotograma
+        # inválido durante LINEA_PERDIDA no es "sin error", es
+        # directamente peor y ya queda capturado por tiempo_por_estado.
+        if error_valido is None or estado not in ESTADOS_EN_SEGUIMIENTO:
             return
 
         tramo.errores.append(abs(error_valido))
@@ -115,34 +141,84 @@ class RecolectorMetricas:
             self._signo_error_anterior = signo_actual
             self._magnitud_error_anterior = magnitud_actual
 
+    @staticmethod
+    def _resumir(
+        nombre: str,
+        errores: list,
+        esfuerzo: list,
+        salidas_de_pista: int,
+        tiempo_fuera_de_pista: float,
+        cambios_de_signo: int,
+        tiempo_total: float,
+        tiempo_detenido_forzado: float,
+        tiempo_por_estado: dict,
+    ) -> dict:
+        """Arma el diccionario de resumen a partir de los acumulados,
+        usado tanto por tramo como para el total.
+
+        Recibe: los acumulados de un tramo o de toda la corrida.
+        Devuelve: dict con error_medio y error_max (solo sobre
+            fotogramas de seguimiento normal), salidas_de_pista,
+            tiempo_fuera_de_pista, oscilacion, esfuerzo_medio, tiempo,
+            tiempo_detenido_forzado, tiempo_por_estado,
+            porcentaje_tiempo_por_estado, porcentaje_en_seguimiento y
+            puntuacion_global (error medio en seguimiento normal más
+            una penalización fuerte por cada segundo fuera de
+            seguimiento: así un barrido de ganancias no puede mejorar
+            esta puntuación simplemente perdiendo la línea).
+        Complejidad: O(k) sobre la cantidad de estados distintos.
+        """
+        tiempo_fuera_de_seguimiento = sum(
+            segundos for estado, segundos in tiempo_por_estado.items() if estado not in ESTADOS_EN_SEGUIMIENTO
+        )
+        porcentaje_tiempo_por_estado = {
+            estado: 100.0 * segundos / tiempo_total if tiempo_total > 0 else 0.0
+            for estado, segundos in tiempo_por_estado.items()
+        }
+        porcentaje_en_seguimiento = 100.0 - sum(
+            pct for estado, pct in porcentaje_tiempo_por_estado.items() if estado not in ESTADOS_EN_SEGUIMIENTO
+        )
+        error_medio = sum(errores) / len(errores) if errores else 0.0
+
+        return {
+            "nombre": nombre,
+            "error_medio": error_medio,
+            "error_max": max(errores) if errores else 0.0,
+            "salidas_de_pista": salidas_de_pista,
+            "tiempo_fuera_de_pista": tiempo_fuera_de_pista,
+            "oscilacion": cambios_de_signo / tiempo_total if tiempo_total > 0 else 0.0,
+            "esfuerzo_medio": sum(esfuerzo) / len(esfuerzo) if esfuerzo else 0.0,
+            "tiempo": tiempo_total,
+            "tiempo_detenido_forzado": tiempo_detenido_forzado,
+            "tiempo_por_estado": dict(tiempo_por_estado),
+            "porcentaje_tiempo_por_estado": porcentaje_tiempo_por_estado,
+            "porcentaje_en_seguimiento": porcentaje_en_seguimiento,
+            "puntuacion_global": error_medio + PESO_TIEMPO_FUERA_DE_SEGUIMIENTO * tiempo_fuera_de_seguimiento,
+        }
+
     def resumen_por_tramo(self) -> list[dict]:
         """Calcula el resumen de métricas de cada tramo, en el orden en
         que se visitaron por primera vez.
 
         Recibe: nada.
-        Devuelve: lista de diccionarios con error_medio, error_max,
-            salidas_de_pista, tiempo_fuera_de_pista, oscilacion (cambios
-            de signo por segundo) y esfuerzo_medio, uno por tramo.
+        Devuelve: lista de diccionarios (ver _resumir), uno por tramo.
         Complejidad: O(n) sobre la cantidad de fotogramas acumulados.
         """
-        resumen = []
-        for nombre in self._orden_tramos:
-            tramo = self._tramos[nombre]
-            errores = tramo.errores
-            resumen.append(
-                {
-                    "nombre": nombre,
-                    "error_medio": sum(errores) / len(errores) if errores else 0.0,
-                    "error_max": max(errores) if errores else 0.0,
-                    "salidas_de_pista": tramo.salidas_de_pista,
-                    "tiempo_fuera_de_pista": tramo.tiempo_fuera_de_pista,
-                    "oscilacion": tramo.cambios_de_signo / tramo.tiempo if tramo.tiempo > 0 else 0.0,
-                    "esfuerzo_medio": sum(tramo.esfuerzo) / len(tramo.esfuerzo) if tramo.esfuerzo else 0.0,
-                    "tiempo": tramo.tiempo,
-                    "tiempo_detenido_forzado": tramo.tiempo_detenido_forzado,
-                }
+        return [
+            self._resumir(
+                nombre,
+                tramo.errores,
+                tramo.esfuerzo,
+                tramo.salidas_de_pista,
+                tramo.tiempo_fuera_de_pista,
+                tramo.cambios_de_signo,
+                tramo.tiempo,
+                tramo.tiempo_detenido_forzado,
+                tramo.tiempo_por_estado,
             )
-        return resumen
+            for nombre in self._orden_tramos
+            for tramo in [self._tramos[nombre]]
+        ]
 
     def resumen_total(self) -> dict:
         """Calcula el resumen agregado de toda la corrida (todos los tramos).
@@ -159,6 +235,7 @@ class RecolectorMetricas:
         cambios_de_signo = 0
         tiempo_total = 0.0
         tiempo_detenido_forzado = 0.0
+        tiempo_por_estado: dict = {}
         for tramo in self._tramos.values():
             errores.extend(tramo.errores)
             esfuerzo.extend(tramo.esfuerzo)
@@ -167,15 +244,17 @@ class RecolectorMetricas:
             cambios_de_signo += tramo.cambios_de_signo
             tiempo_total += tramo.tiempo
             tiempo_detenido_forzado += tramo.tiempo_detenido_forzado
+            for estado, segundos in tramo.tiempo_por_estado.items():
+                tiempo_por_estado[estado] = tiempo_por_estado.get(estado, 0.0) + segundos
 
-        return {
-            "nombre": "TOTAL",
-            "error_medio": sum(errores) / len(errores) if errores else 0.0,
-            "error_max": max(errores) if errores else 0.0,
-            "salidas_de_pista": salidas_de_pista,
-            "tiempo_fuera_de_pista": tiempo_fuera_de_pista,
-            "oscilacion": cambios_de_signo / tiempo_total if tiempo_total > 0 else 0.0,
-            "esfuerzo_medio": sum(esfuerzo) / len(esfuerzo) if esfuerzo else 0.0,
-            "tiempo": tiempo_total,
-            "tiempo_detenido_forzado": tiempo_detenido_forzado,
-        }
+        return self._resumir(
+            "TOTAL",
+            errores,
+            esfuerzo,
+            salidas_de_pista,
+            tiempo_fuera_de_pista,
+            cambios_de_signo,
+            tiempo_total,
+            tiempo_detenido_forzado,
+            tiempo_por_estado,
+        )

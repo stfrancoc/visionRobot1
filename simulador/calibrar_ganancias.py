@@ -17,15 +17,20 @@ from simulador.pista_virtual import PistaVirtual, crear_pista_calibracion
 
 RUTA_SALIDA_CSV = os.path.join(os.path.dirname(os.path.dirname(__file__)), "capturas", "barrido_ganancias.csv")
 
-RANGO_KP = [1.0, 2.0, 3.0, 5.0, 8.0, 10.0, 15.0, 20.0, 25.0, 30.0]  # Valores de KP a probar en el barrido.
+RANGO_KP = [1.0, 2.0, 3.0, 5.0, 8.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 50.0]  # Valores de KP a probar en el barrido.
 RANGO_KD = [0.0, 2.0, 5.0, 8.0, 10.0, 15.0, 20.0]  # Valores de KD a probar en el barrido.
 RANGO_KA = [0.0, 5.0, 10.0, 15.0]  # Valores de KA a probar en el barrido.
 
-PESO_ERROR_MEDIO = 1.0  # Peso del error medio absoluto en la puntuación (más bajo es mejor).
+# La base de la puntuación es puntuacion_global de RecolectorMetricas
+# (error medio EN SEGUIMIENTO NORMAL más una penalización fuerte por
+# cada segundo fuera de seguimiento, en LINEA_PERDIDA/DETENIDO): así el
+# barrido no puede mejorar su puntuación simplemente perdiendo la
+# línea (ver PESO_TIEMPO_FUERA_DE_SEGUIMIENTO en metricas_simulacion.py).
+# Estos pesos adicionales afinan la puntuación dentro del régimen de
+# seguimiento normal.
 PESO_OSCILACION = 0.6  # Peso de la oscilación (cambios de signo/s) en la puntuación: penaliza KP demasiado alto.
-PESO_SALIDAS_DE_PISTA = 2.0  # Peso de las salidas de pista en la puntuación: una salida pesa como mucho error acumulado.
-PESO_TIEMPO_FUERA = 1.5  # Peso del tiempo fuera de pista, además del conteo de salidas.
-PESO_TIEMPO_DETENIDO = 3.0  # Peso del tiempo en DETENIDO: el robot se dio por perdido y no se recupera solo, es el peor desenlace posible.
+PESO_SALIDAS_DE_PISTA = 2.0  # Peso de las salidas de pista (dentro de seguimiento normal) en la puntuación.
+PESO_TIEMPO_FUERA = 1.5  # Peso del tiempo con |error|>1 dentro de seguimiento normal, además del conteo de salidas.
 
 CANTIDAD_MEJORES_A_MOSTRAR = 10  # Cuántas combinaciones imprimir en la tabla final.
 
@@ -82,18 +87,18 @@ def _correr_pista(kp: float, kd: float, ka: float, modo_ideal: bool) -> dict:
 def _puntuar(resumen: dict) -> float:
     """Calcula la puntuación de una corrida (más bajo es mejor).
 
-    Recibe: resumen (dict de _correr_pista, con error_medio, oscilacion,
-        salidas_de_pista y tiempo_fuera_de_pista).
-    Devuelve: float, combinación ponderada que penaliza fuerte la
-        oscilación y las salidas de pista.
+    Recibe: resumen (dict de _correr_pista; incluye puntuacion_global de
+        RecolectorMetricas, que ya castiga el tiempo fuera de
+        seguimiento normal).
+    Devuelve: float, puntuacion_global más ajustes por oscilación y
+        salidas/tiempo fuera de pista dentro de seguimiento normal.
     Complejidad: O(1).
     """
     puntuacion = (
-        PESO_ERROR_MEDIO * resumen["error_medio"]
+        resumen["puntuacion_global"]
         + PESO_OSCILACION * resumen["oscilacion"]
         + PESO_SALIDAS_DE_PISTA * resumen["salidas_de_pista"]
         + PESO_TIEMPO_FUERA * resumen["tiempo_fuera_de_pista"]
-        + PESO_TIEMPO_DETENIDO * resumen["tiempo_detenido_forzado"]
     )
     if not resumen["recorrido_completo"]:
         # No terminó la pista (se quedó atascado): se penaliza fuerte
@@ -127,12 +132,16 @@ def _imprimir_tabla(titulo: str, resultados: list[dict]) -> None:
     Complejidad: O(CANTIDAD_MEJORES_A_MOSTRAR).
     """
     print(f"\n{titulo}")
-    encabezado = f"{'KP':>6} {'KD':>6} {'KA':>6} {'err_medio':>10} {'err_max':>9} {'oscil/s':>8} {'salidas':>8} {'t_fuera':>8} {'t_deten':>8} {'esfuerzo':>9} {'puntuacion':>11}"
+    encabezado = (
+        f"{'KP':>6} {'KD':>6} {'KA':>6} {'%segui':>7} {'err_medio':>10} {'err_max':>9} "
+        f"{'oscil/s':>8} {'salidas':>8} {'t_fuera':>8} {'t_deten':>8} {'esfuerzo':>9} {'puntuacion':>11}"
+    )
     print(encabezado)
     print("-" * len(encabezado))
     for resumen in resultados[:CANTIDAD_MEJORES_A_MOSTRAR]:
         print(
             f"{resumen['kp']:>6.1f} {resumen['kd']:>6.1f} {resumen['ka']:>6.1f} "
+            f"{resumen['porcentaje_en_seguimiento']:>6.1f}% "
             f"{resumen['error_medio']:>10.4f} {resumen['error_max']:>9.4f} "
             f"{resumen['oscilacion']:>8.2f} {resumen['salidas_de_pista']:>8} "
             f"{resumen['tiempo_fuera_de_pista']:>8.2f} {resumen['tiempo_detenido_forzado']:>8.2f} "
@@ -149,10 +158,10 @@ def _guardar_csv(resultados_realista: list[dict], resultados_ideal: list[dict]) 
     """
     os.makedirs(os.path.dirname(RUTA_SALIDA_CSV), exist_ok=True)
     columnas = [
-        "modo_ideal", "kp", "kd", "ka", "error_medio", "error_max",
-        "oscilacion", "salidas_de_pista", "tiempo_fuera_de_pista",
-        "tiempo_detenido_forzado", "esfuerzo_medio", "tiempo",
-        "recorrido_completo", "puntuacion",
+        "modo_ideal", "kp", "kd", "ka", "porcentaje_en_seguimiento",
+        "error_medio", "error_max", "oscilacion", "salidas_de_pista",
+        "tiempo_fuera_de_pista", "tiempo_detenido_forzado", "esfuerzo_medio",
+        "tiempo", "recorrido_completo", "puntuacion_global", "puntuacion",
     ]
     with open(RUTA_SALIDA_CSV, "w", newline="", encoding="utf-8") as archivo:
         escritor = csv.DictWriter(archivo, fieldnames=columnas)
@@ -185,8 +194,16 @@ def ejecutar_barrido() -> None:
     mejor_realista = resultados_realista[0]
     mejor_ideal = resultados_ideal[0]
     print("\n[Calibrar] Comparación ideal vs. realista (mejores combinaciones de cada uno):")
-    print(f"  ideal:    KP={mejor_ideal['kp']:.1f} KD={mejor_ideal['kd']:.1f} KA={mejor_ideal['ka']:.1f}  error_medio={mejor_ideal['error_medio']:.4f}  oscilacion={mejor_ideal['oscilacion']:.2f}/s")
-    print(f"  realista: KP={mejor_realista['kp']:.1f} KD={mejor_realista['kd']:.1f} KA={mejor_realista['ka']:.1f}  error_medio={mejor_realista['error_medio']:.4f}  oscilacion={mejor_realista['oscilacion']:.2f}/s")
+    print(
+        f"  ideal:    KP={mejor_ideal['kp']:.1f} KD={mejor_ideal['kd']:.1f} KA={mejor_ideal['ka']:.1f}  "
+        f"%seguimiento={mejor_ideal['porcentaje_en_seguimiento']:.1f}%  error_medio={mejor_ideal['error_medio']:.4f}  "
+        f"oscilacion={mejor_ideal['oscilacion']:.2f}/s"
+    )
+    print(
+        f"  realista: KP={mejor_realista['kp']:.1f} KD={mejor_realista['kd']:.1f} KA={mejor_realista['ka']:.1f}  "
+        f"%seguimiento={mejor_realista['porcentaje_en_seguimiento']:.1f}%  error_medio={mejor_realista['error_medio']:.4f}  "
+        f"oscilacion={mejor_realista['oscilacion']:.2f}/s"
+    )
 
     _guardar_csv(resultados_realista, resultados_ideal)
 

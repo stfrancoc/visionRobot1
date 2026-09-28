@@ -43,9 +43,27 @@ GANANCIA_ORIENTACION = 0.05  # Qué tanto cambia la orientación por unidad de d
 GANANCIA_POSICION = 0.8  # Qué tanto cambia la posición lateral por unidad de (orientación × velocidad de avance × dt).
 GANANCIA_CURVATURA = 0.012  # Qué tanto empuja la curvatura del tramo a la posición lateral por unidad de (velocidad de avance × dt).
 DISTANCIA_FRANJA_LEJANA = 0.35  # Fracción de la pista que se "adelanta" para estimar el ángulo (curva próxima).
-ORIENTACION_MAXIMA = 1.5  # Máximo ángulo relativo a la línea (radianes-equivalente); más allá el robot ya está de costado.
+ORIENTACION_MAXIMA = 1.5  # Máximo ángulo relativo a la línea (radianes-equivalente) durante seguimiento normal; más allá el robot ya está de costado.
 VELOCIDAD_AVANCE_UMBRAL_GIRO = 5.0  # |velocidad_avance| por debajo de este umbral se considera "girando en el sitio" (búsqueda), no avanzando.
-GIRO_BARRIDO_COMPLETO = 1.5  # Cuánta rotación acumulada (en las mismas unidades que orientación × dt) representa un barrido completo de la cámara sobre el terreno al girar buscando la línea.
+
+# Campo de visión angular de la cámara (misma escala arbitraria que
+# `orientacion`): coincide con ORIENTACION_MAXIMA, el ángulo más allá
+# del cual el chasis ya se considera "de costado" en seguimiento
+# normal. Mientras el chasis gira buscando la línea, esta sigue siendo
+# visible solo si su rumbo actual cae dentro de este ángulo; fuera de
+# él, la línea existe pero está fuera de cuadro, igual que le pasaría a
+# una cámara real con un ángulo de visión limitado.
+ANGULO_CAMPO_VISION = ORIENTACION_MAXIMA
+
+# Cuánto vale una "vuelta completa" del chasis en la escala arbitraria
+# de `orientacion` (no son radianes reales). Calibrado para que, girando
+# en el sitio a VEL_BUSQUEDA, una vuelta complete tome ~2 segundos: con
+# GANANCIA_ORIENTACION=0.05 y una diferencia de ruedas típica de
+# 2×VEL_BUSQUEDA=70, el cambio es 3.5/segundo, así que 2s de giro dan
+# VUELTA_COMPLETA≈7.0. Sin esto, `orientacion` crecería sin límite en
+# una sola dirección mientras el robot gira buscando siempre hacia el
+# mismo lado, y nunca volvería a caer dentro de ANGULO_CAMPO_VISION.
+VUELTA_COMPLETA = 7.0
 
 
 @dataclass
@@ -118,18 +136,19 @@ class PistaVirtual:
         self.fuera_de_pista_eventos = 0
         self._fuera_de_pista_anterior = False
 
+        # True mientras el chasis está girando en el sitio buscando la
+        # línea. Se usa para decidir con qué criterio se evalúa la
+        # visibilidad: en seguimiento normal, un umbral de distancia
+        # decide cuándo se pierde la línea; una vez en búsqueda, solo el
+        # ángulo del chasis decide cuándo se recupera (girar en el sitio
+        # no acerca al robot lateralmente, así que exigir de nuevo el
+        # umbral de distancia dejaría la búsqueda sin salida posible).
+        self._buscando_activamente = False
+
         # Velocidad real de cada rueda tras zona muerta + inercia (lo que
         # de verdad mueve el chasis), separada del comando recién emitido.
         self._velocidad_real_izquierda = 0.0
         self._velocidad_real_derecha = 0.0
-
-        # Rotación acumulada mientras el robot gira en el sitio buscando
-        # la línea (fuera de un tramo "sin_linea" con temporizador
-        # propio): representa cuánto ha barrido la cámara sobre el
-        # terreno, para poder reencontrar la línea sin que la posición
-        # lateral quede congelada para siempre. Se reinicia en cuanto el
-        # robot vuelve a avanzar de verdad.
-        self._rotacion_acumulada_busqueda = 0.0
 
         # Dos tramos de latencia distintos y consecutivos del mismo lazo,
         # cada uno con su propia cola: percepción (cámara+WiFi+visión,
@@ -150,7 +169,7 @@ class PistaVirtual:
         # para que el arranque de la simulación ya tenga de dónde leer.
         self._cola_comandos = deque([(0, 0)] * self._pasos_actuacion, maxlen=self._pasos_actuacion or None)
         self._cola_estado = deque(
-            [(0.0, 0.0, self.indice_tramo, self.avance_tramo)] * self._pasos_percepcion,
+            [(0.0, 0.0, self.indice_tramo, self.avance_tramo, False)] * self._pasos_percepcion,
             maxlen=self._pasos_percepcion or None,
         )
 
@@ -275,37 +294,33 @@ class PistaVirtual:
             # positivo, "línea a la derecha", moviendo el chasis hacia la
             # derecha).
             diferencia_ruedas = velocidad_izquierda - velocidad_derecha
-            cambio_orientacion = GANANCIA_ORIENTACION * diferencia_ruedas * dt
-            self.orientacion += cambio_orientacion
-            self.orientacion = max(-ORIENTACION_MAXIMA, min(ORIENTACION_MAXIMA, self.orientacion))
+            self.orientacion += GANANCIA_ORIENTACION * diferencia_ruedas * dt
 
             girando_en_sitio = abs(velocidad_avance) < VELOCIDAD_AVANCE_UMBRAL_GIRO and abs(diferencia_ruedas) > 0
+            self._buscando_activamente = girando_en_sitio
 
             if girando_en_sitio:
-                # El chasis casi no avanza, pero sí rota: la cámara barre
-                # el terreno y, sin importar qué tan lejos haya quedado
-                # el robot, la línea sigue siendo un punto fijo que el
-                # barrido cruza una vez por vuelta. Se acumula cuánto ha
-                # girado y, al completar un barrido, se asume que la
-                # visión ya reencontró la línea: la posición lateral
-                # "salta" a quedar justo dentro del borde de la pista,
-                # del lado en que estaba, lista para que SEGUIR_LINEA
-                # retome el control (sin importar si el robot había
-                # quedado a 1 o a 10 anchos de pista de distancia).
-                self._rotacion_acumulada_busqueda += abs(cambio_orientacion)
-                if self._rotacion_acumulada_busqueda >= GIRO_BARRIDO_COMPLETO:
-                    self._rotacion_acumulada_busqueda = 0.0
-                    signo_posicion = 1.0 if self.posicion_lateral >= 0 else -1.0
-                    self.posicion_lateral = signo_posicion * ANCHO_PISTA * 0.9
-                    self.orientacion = 0.0
+                # La orientación es aquí el rumbo real del chasis, que
+                # sigue girando siempre hacia el mismo lado mientras
+                # busca: sin una noción de "vuelta completa" crecería
+                # para siempre y nunca volvería a caer dentro del campo
+                # de visión. Se envuelve como un ángulo real (equivalente
+                # a wrap a [-π, π]), así que tras suficiente rotación
+                # vuelve a acercarse a 0 desde el lado opuesto, cruzando
+                # de nuevo ANGULO_CAMPO_VISION de forma continua.
+                self.orientacion = (self.orientacion + VUELTA_COMPLETA / 2) % VUELTA_COMPLETA - VUELTA_COMPLETA / 2
             else:
-                self._rotacion_acumulada_busqueda = 0.0
-                # La posición lateral solo cambia por el rumbo cuando el
-                # robot efectivamente avanza (o retrocede): girar en el
-                # sitio, con velocidad de avance ~0, no debería desplazar
-                # el centroide por sí solo (eso ya lo cubre el barrido).
-                self.posicion_lateral -= GANANCIA_POSICION * self.orientacion * velocidad_avance * dt
-                self.posicion_lateral += GANANCIA_CURVATURA * tramo.curvatura * velocidad_avance * dt
+                # El límite de ORIENTACION_MAXIMA solo aplica en
+                # seguimiento normal, para que el ángulo reportado no se
+                # dispare mientras se sigue la línea.
+                self.orientacion = max(-ORIENTACION_MAXIMA, min(ORIENTACION_MAXIMA, self.orientacion))
+
+            # La posición lateral cambia por el rumbo y por la curvatura
+            # del tramo en todo momento (también al girar en el sitio,
+            # donde velocidad_avance es ~0 y por lo tanto este término se
+            # anula naturalmente sin necesitar un caso especial).
+            self.posicion_lateral -= GANANCIA_POSICION * self.orientacion * velocidad_avance * dt
+            self.posicion_lateral += GANANCIA_CURVATURA * tramo.curvatura * velocidad_avance * dt
 
             fuera_de_pista = abs(self.posicion_lateral) > ANCHO_PISTA
             if fuera_de_pista and not self._fuera_de_pista_anterior:
@@ -325,7 +340,9 @@ class PistaVirtual:
             self.indice_tramo += 1
 
         if self._pasos_percepcion > 0:
-            self._cola_estado.append((self.posicion_lateral, self.orientacion, self.indice_tramo, self.avance_tramo))
+            self._cola_estado.append(
+                (self.posicion_lateral, self.orientacion, self.indice_tramo, self.avance_tramo, self._buscando_activamente)
+            )
 
     def _con_ruido(self, valor: float, desviacion: float) -> float:
         """Agrega ruido gaussiano opcional a un valor.
@@ -339,11 +356,12 @@ class PistaVirtual:
             return valor
         return valor + self.aleatorio.gauss(0.0, desviacion)
 
-    def _estado_observado(self) -> tuple[float, float, int, float]:
-        """Devuelve (posicion, orientacion, indice_tramo, avance_tramo)
-        tal como los "vería" la visión ahora mismo: el estado real si no
-        hay latencia de percepción configurada, o el estado de hace
-        LATENCIA_PERCEPCION_MS si sí la hay.
+    def _estado_observado(self) -> tuple[float, float, int, float, bool]:
+        """Devuelve (posicion, orientacion, indice_tramo, avance_tramo,
+        buscando_activamente) tal como los "vería" la visión ahora
+        mismo: el estado real si no hay latencia de percepción
+        configurada, o el estado de hace LATENCIA_PERCEPCION_MS si sí la
+        hay.
 
         Recibe: nada.
         Devuelve: tupla con el estado retrasado usado para generar los
@@ -351,7 +369,7 @@ class PistaVirtual:
         Complejidad: O(1).
         """
         if self._pasos_percepcion == 0:
-            return self.posicion_lateral, self.orientacion, self.indice_tramo, self.avance_tramo
+            return self.posicion_lateral, self.orientacion, self.indice_tramo, self.avance_tramo, self._buscando_activamente
         return self._cola_estado[0]
 
     def generar_resultado_linea(self) -> ResultadoLinea:
@@ -363,18 +381,31 @@ class PistaVirtual:
         Devuelve: ResultadoLinea con error y angulo derivados de la
             posición/orientación observadas, o valida=False si el robot
             (en el instante observado) estaba fuera de la pista, en la
-            primera mitad de un tramo "sin_linea", o si un fallo
-            aleatorio de detección lo marca inválido pese a estar sobre
-            la línea.
+            primera mitad de un tramo "sin_linea", girando fuera del
+            campo de visión, o si un fallo aleatorio de detección lo
+            marca inválido pese a estar sobre la línea.
         Complejidad: O(1).
         """
-        posicion, orientacion, indice_tramo, avance_tramo = self._estado_observado()
+        posicion, orientacion, indice_tramo, avance_tramo, buscando_activamente = self._estado_observado()
         tramo = self.tramos[indice_tramo] if indice_tramo < len(self.tramos) else None
 
         linea_ausente = tramo is not None and tramo.tipo == "sin_linea" and avance_tramo < tramo.longitud * 0.5
-        fuera_de_pista = abs(posicion) > ANCHO_PISTA
 
-        if tramo is None or linea_ausente or fuera_de_pista:
+        # El criterio de visibilidad es distinto para perder la línea que
+        # para recuperarla, porque girar en el sitio no acerca al robot
+        # lateralmente (solo cambia su rumbo): en seguimiento normal, un
+        # umbral de distancia decide cuándo la línea sale de la pista y
+        # arranca la búsqueda; una vez en búsqueda, solo el ángulo del
+        # chasis decide cuándo vuelve a estar dentro del campo de visión
+        # de la cámara (si se exigiera de nuevo el umbral de distancia,
+        # la búsqueda no tendría salida posible mientras el robot siga
+        # girando sin avanzar).
+        if buscando_activamente:
+            perdida = abs(orientacion) > ANGULO_CAMPO_VISION
+        else:
+            perdida = abs(posicion) > ANCHO_PISTA
+
+        if tramo is None or linea_ausente or perdida:
             return ResultadoLinea(error=0.0, angulo=0.0, confianza=0, valida=False)
 
         if not self.modo_ideal and self.aleatorio.random() < config.PROB_LINEA_INVALIDA:
@@ -401,7 +432,7 @@ class PistaVirtual:
             acerca).
         Complejidad: O(1).
         """
-        _, _, indice_tramo, avance_tramo = self._estado_observado()
+        _, _, indice_tramo, avance_tramo, _ = self._estado_observado()
         tramo = self.tramos[indice_tramo] if indice_tramo < len(self.tramos) else None
 
         if tramo is None or tramo.tipo not in ("pare", "siga"):

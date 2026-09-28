@@ -36,7 +36,13 @@ KA = 15.0  # Ganancia sobre el ángulo estimado: anticipa curvas antes de que cr
 ALFA_SUAVIZADO = 0.4  # Peso del error nuevo en la media exponencial (0-1). Más alto = menos suavizado.
 
 VEL_BASE = 60  # Velocidad de avance en tramo recto, con error y ángulo cercanos a cero.
-VEL_MIN = 25  # Velocidad de avance mínima en curvas cerradas (error o ángulo altos).
+
+# Velocidad de avance mínima en curvas cerradas (error o ángulo altos).
+# Con 25 quedaba demasiado cerca de ZONA_MUERTA=18 (solo 7 unidades de
+# margen sobre un rango de 100): cualquier giro, aunque fuera pequeño,
+# hacía que una rueda cayera por debajo del umbral y perdiera
+# corrección por completo. 38 deja ~20 unidades de margen.
+VEL_MIN = 38
 
 # Límite superior de velocidad para cada rueda, en ambos sentidos: el
 # rango de ComandoRobot.izquierda/derecha es [-VEL_MAX, VEL_MAX] = [-100,

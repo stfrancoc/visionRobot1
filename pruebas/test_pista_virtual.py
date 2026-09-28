@@ -49,25 +49,41 @@ class PruebasZonaMuerta(unittest.TestCase):
 
 
 class PruebasRecuperacionLineaPerdida(unittest.TestCase):
-    """Verifica que girar en el sitio pueda traer de vuelta al robot
-    incluso cuando quedó muy lejos del carril, en un tramo sin
-    temporizador de reaparición (a diferencia de "sin_linea").
+    """Verifica que girar en el sitio pueda volver a hacer visible la
+    línea (vía el ángulo del chasis) incluso cuando el robot quedó muy
+    lejos lateralmente, en un tramo sin temporizador de reaparición (a
+    diferencia de "sin_linea"). Girar en el sitio no acerca al robot
+    lateralmente (la posición no cambia), así que la recuperación se
+    mide por si vuelve a reportar valida=True, no por la posición.
     """
 
-    def test_barrido_recupera_posicion_lejana(self):
+    def test_giro_en_sitio_recupera_visibilidad_pese_a_posicion_lejana(self):
         pista = PistaVirtual([Tramo(tipo="recta", longitud=30.0)], modo_ideal=False, semilla=1)
-        pista.posicion_lateral = 8.0  # Muy lejos del carril (|pos| > ANCHO_PISTA).
-
         dt = config.PASO_SIMULACION_MS / 1000.0
+
+        # Empuja la posición lateral lejos del carril a través de paso(),
+        # no asignando el atributo directamente: así la cola de estado
+        # retrasado (que modela la latencia de percepción) también queda
+        # coherente con la posición lejana, igual que en el uso real.
+        pista.posicion_lateral = 8.0
+        for _ in range(pista._pasos_percepcion + 1):
+            pista.paso(0, 0, dt)
+
         pasos_maximos = 500  # Suficientes para varias vueltas de búsqueda.
         recuperado = False
         for _ in range(pasos_maximos):
             pista.paso(-35, 35, dt)  # Girar en el sitio, como control.girar_en_sitio().
-            if abs(pista.posicion_lateral) <= 1.0:
+            resultado = pista.generar_resultado_linea()
+            if resultado.valida:
                 recuperado = True
                 break
 
-        self.assertTrue(recuperado, "girar en el sitio debe poder recuperar una posición lejana")
+        self.assertTrue(recuperado, "girar en el sitio debe volver a hacer visible la línea por ángulo")
+        # La posición lateral no cambia por girar en el sitio: sigue
+        # lejos, y el error se satura cerca del límite (el ruido de
+        # sensor puede empujarlo un poco más allá) en vez de bloquear
+        # la validez.
+        self.assertGreater(abs(resultado.error), 0.9)
 
 
 if __name__ == "__main__":

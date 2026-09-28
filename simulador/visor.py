@@ -154,14 +154,19 @@ def _imprimir_metricas(recolector: RecolectorMetricas) -> None:
     """
 
     def _imprimir_fila(fila: dict) -> None:
+        porcentajes_estado = ", ".join(
+            f"{estado}={pct:.1f}%" for estado, pct in sorted(fila["porcentaje_tiempo_por_estado"].items(), key=lambda kv: -kv[1])
+        )
         print(
             f"  {fila['nombre']:<24} "
-            f"err_medio={fila['error_medio']:.4f}  err_max={fila['error_max']:.4f}  "
+            f"%seguimiento={fila['porcentaje_en_seguimiento']:.1f}%  "
+            f"err_medio(seguimiento)={fila['error_medio']:.4f}  err_max={fila['error_max']:.4f}  "
             f"salidas={fila['salidas_de_pista']}  t_fuera={fila['tiempo_fuera_de_pista']:.2f}s  "
             f"t_detenido={fila['tiempo_detenido_forzado']:.2f}s  "
             f"oscilacion={fila['oscilacion']:.2f}/s  esfuerzo_medio={fila['esfuerzo_medio']:.2f}  "
-            f"tiempo={fila['tiempo']:.2f}s"
+            f"tiempo={fila['tiempo']:.2f}s  puntuacion_global={fila['puntuacion_global']:.4f}"
         )
+        print(f"      por estado: {porcentajes_estado}")
 
     print("\n[Visor] Métricas totales:")
     _imprimir_fila(recolector.resumen_total())

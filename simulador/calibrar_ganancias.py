@@ -178,7 +178,8 @@ def ejecutar_barrido() -> None:
     resultados_realista = _barrer(modo_ideal=False)
     resultados_ideal = _barrer(modo_ideal=True)
 
-    _imprimir_tabla(f"Mejores {CANTIDAD_MEJORES_A_MOSTRAR} combinaciones — simulador REALISTA (latencia={config.LATENCIA_MS}ms, zona muerta, ruido)", resultados_realista)
+    latencia_total_ms = config.LATENCIA_PERCEPCION_MS + config.LATENCIA_ACTUACION_MS
+    _imprimir_tabla(f"Mejores {CANTIDAD_MEJORES_A_MOSTRAR} combinaciones — simulador REALISTA (latencia total={latencia_total_ms}ms, zona muerta, ruido)", resultados_realista)
     _imprimir_tabla(f"Mejores {CANTIDAD_MEJORES_A_MOSTRAR} combinaciones — simulador IDEAL (sin latencia/motores/ruido)", resultados_ideal)
 
     mejor_realista = resultados_realista[0]

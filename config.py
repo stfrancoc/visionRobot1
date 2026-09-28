@@ -21,22 +21,30 @@ RUTA_CALIBRACION_CONTROL = os.path.join(os.path.dirname(__file__), "calibracion_
 # ==========================================================================
 
 # Calibradas con simulador/calibrar_ganancias.py sobre el simulador
-# REALISTA (latencia=150ms, motores con zona muerta/inercia, ruido de
-# detección): con el simulador ideal convenía KP=20 KD=10 KA=10, pero
-# esas ganancias oscilan bajo latencia real (error medio ~0.70 y
-# oscilación medible). KP=5 KD=5 KA=10 es la mejor combinación
-# encontrada bajo condiciones realistas (error medio ~0.53, sin
-# salidas de pista) y es el punto de partida recomendado para la
-# primera prueba con el robot físico.
-KP = 5.0  # Ganancia proporcional: qué tanto giro (en unidades de velocidad de rueda) se aplica por unidad de error lateral en [-1, 1].
+# REALISTA (latencia total=150ms repartida en percepción+actuación,
+# motores con zona muerta/inercia, ruido de detección). El barrido con
+# semilla fija eligió KP=20 KD=2 KA=15, pero promediando sobre varias
+# semillas distintas (para descartar sobreajuste a una corrida
+# particular) esa combinación no fue la más robusta: KP=10 KD=5 KA=15
+# dio mejor error promedio (~0.52) y menor oscilación promedio (~0.26)
+# que tanto el ganador de una sola semilla como el default anterior
+# (KP=5 KD=5 KA=10, de cuando la latencia estaba duplicada por error).
+KP = 10.0  # Ganancia proporcional: qué tanto giro (en unidades de velocidad de rueda) se aplica por unidad de error lateral en [-1, 1].
 KD = 5.0  # Ganancia derivativa: amortigua oscilaciones reaccionando a qué tan rápido cambia el error suavizado.
-KA = 10.0  # Ganancia sobre el ángulo estimado: anticipa curvas antes de que crezca el error lateral.
+KA = 15.0  # Ganancia sobre el ángulo estimado: anticipa curvas antes de que crezca el error lateral.
 
 ALFA_SUAVIZADO = 0.4  # Peso del error nuevo en la media exponencial (0-1). Más alto = menos suavizado.
 
 VEL_BASE = 60  # Velocidad de avance en tramo recto, con error y ángulo cercanos a cero.
 VEL_MIN = 25  # Velocidad de avance mínima en curvas cerradas (error o ángulo altos).
-VEL_MAX = 100  # Límite superior de velocidad para cada rueda, en ambos sentidos.
+
+# Límite superior de velocidad para cada rueda, en ambos sentidos: el
+# rango de ComandoRobot.izquierda/derecha es [-VEL_MAX, VEL_MAX] = [-100,
+# 100], NO el PWM 0-255 del Arduino. El compañero de Bluetooth reescala
+# este rango a PWM en su propio código; aquí nunca se habla en unidades
+# de PWM. Si esa reescala cambiara de convención, KP/KD/KA habría que
+# recalibrarlos, porque dependen de esta escala (ver simulador/calibrar_ganancias.py).
+VEL_MAX = 100
 
 VEL_BUSQUEDA = 35  # Velocidad de giro sobre el eje al buscar la línea perdida.
 
@@ -61,10 +69,18 @@ TIEMPO_MAX_PERDIDA = 5.0  # Segundos máximos girando en sitio en LINEA_PERDIDA 
 # a qué tan exigente es la pista virtual para calibrar el control.
 # ==========================================================================
 
-LATENCIA_MS = 150  # Retardo estimado entre lo que ve la cámara y lo que hacen las ruedas (captura WiFi + procesamiento + Bluetooth).
+# La latencia total del lazo cerrado (150ms estimados) se reparte en dos
+# tramos físicamente distintos, cada uno con su propia cola en
+# pista_virtual.py: percepción (captura por WiFi + procesamiento de
+# visión, hasta tener un ResultadoLinea) y actuación (Bluetooth +
+# firmware, hasta que el comando mueve las ruedas). Aplicar el total a
+# cada cola por separado duplicaría el retardo real a 300ms.
+LATENCIA_PERCEPCION_MS = 120  # Retardo entre que la cámara captura el fotograma y la visión entrega un ResultadoLinea.
+LATENCIA_ACTUACION_MS = 30  # Retardo entre que se emite un ComandoRobot y las ruedas realmente lo ejecutan (Bluetooth + firmware).
+
 PASO_SIMULACION_MS = 50  # Paso de tiempo de la simulación, equivalente a unos 20 fotogramas por segundo.
 
-ZONA_MUERTA = 30  # Velocidad de rueda por debajo de la cual el motor real no arranca (PWM insuficiente).
+ZONA_MUERTA = 18  # Velocidad de rueda por debajo de la cual el motor real no arranca (PWM insuficiente).
 
 TAU_MOTOR = 0.05  # Constante de tiempo (s) del filtro de primer orden que modela la inercia de cada motor.
 

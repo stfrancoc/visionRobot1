@@ -7,11 +7,15 @@ nuestro código cambia la orientación del robot, y la orientación cambia
 su posición lateral respecto a la línea: es un lazo cerrado, igual que
 en la pista física. A eso se le suma:
 
-- Latencia: el comando que mueve las ruedas es el que se emitió hace
-  LATENCIA_MS, no el actual (cola de comandos), y el ResultadoLinea que
-  se entrega al control corresponde a la posición de hace LATENCIA_MS
-  (cola de historial), porque eso es lo que muestra el fotograma que
-  acaba de terminar de procesarse.
+- Latencia: la latencia total del lazo cerrado se reparte en dos tramos
+  físicamente distintos, cada uno con su propia cola. El ResultadoLinea
+  que se entrega al control corresponde a la posición de hace
+  LATENCIA_PERCEPCION_MS (cámara + WiFi + procesamiento de visión), y
+  el comando que mueve las ruedas es el que se emitió hace
+  LATENCIA_ACTUACION_MS (Bluetooth + firmware). Son dos tramos
+  consecutivos del mismo lazo, no dos veces el mismo retardo: la
+  latencia total percibida por el lazo es la suma de ambos, no el
+  doble de una sola.
 - Motores reales: zona muerta (no arrancan con PWM bajo) e inercia
   (filtro de primer orden, no saltan al valor ordenado).
 - Ruido y fallos de detección: ruido gaussiano en error/ángulo,
@@ -127,21 +131,27 @@ class PistaVirtual:
         # robot vuelve a avanzar de verdad.
         self._rotacion_acumulada_busqueda = 0.0
 
-        if modo_ideal or config.LATENCIA_MS <= 0:
-            self._pasos_de_latencia = 0
+        # Dos tramos de latencia distintos y consecutivos del mismo lazo,
+        # cada uno con su propia cola: percepción (cámara+WiFi+visión,
+        # cola de estado) y actuación (Bluetooth+firmware, cola de
+        # comandos). Sumados dan la latencia total del lazo cerrado; no
+        # se debe aplicar el total a cada cola por separado, porque eso
+        # duplicaría el retardo real.
+        if modo_ideal:
+            self._pasos_percepcion = 0
+            self._pasos_actuacion = 0
         else:
-            self._pasos_de_latencia = max(1, round(config.LATENCIA_MS / config.PASO_SIMULACION_MS))
+            self._pasos_percepcion = max(0, round(config.LATENCIA_PERCEPCION_MS / config.PASO_SIMULACION_MS))
+            self._pasos_actuacion = max(0, round(config.LATENCIA_ACTUACION_MS / config.PASO_SIMULACION_MS))
 
         # Cola de comandos pendientes de aplicarse (retardo de actuación) y
         # de estados pasados pendientes de "observarse" (retardo de
-        # percepción): ambas con la misma profundidad, porque la latencia
-        # del pipeline afecta igual a la salida que a la entrada. Se
-        # inicializan llenas (comando y estado en reposo) para que el
-        # primer LATENCIA_MS de simulación ya tenga de dónde leer.
-        self._cola_comandos = deque([(0, 0)] * self._pasos_de_latencia, maxlen=self._pasos_de_latencia or None)
+        # percepción). Se inicializan llenas (comando y estado en reposo)
+        # para que el arranque de la simulación ya tenga de dónde leer.
+        self._cola_comandos = deque([(0, 0)] * self._pasos_actuacion, maxlen=self._pasos_actuacion or None)
         self._cola_estado = deque(
-            [(0.0, 0.0, self.indice_tramo, self.avance_tramo)] * self._pasos_de_latencia,
-            maxlen=self._pasos_de_latencia or None,
+            [(0.0, 0.0, self.indice_tramo, self.avance_tramo)] * self._pasos_percepcion,
+            maxlen=self._pasos_percepcion or None,
         )
 
     def tramo_actual(self) -> Tramo | None:
@@ -221,20 +231,27 @@ class PistaVirtual:
         Recibe: izquierda, derecha (velocidades de rueda decididas por
             el controlador para ESTE instante) y dt (segundos).
         Devuelve: nada; encola el comando (se aplicará con retardo de
-            LATENCIA_MS), avanza la cinemática con el comando que le
-            corresponde a este paso según esa cola, y guarda el estado
-            resultante en el historial de observación.
-        Complejidad: O(1) (la cola tiene tamaño fijo).
+            LATENCIA_ACTUACION_MS), avanza la cinemática con el comando
+            que le corresponde a este paso según esa cola, y guarda el
+            estado resultante en el historial de observación (que se
+            leerá con retardo de LATENCIA_PERCEPCION_MS).
+        Complejidad: O(1) (las colas tienen tamaño fijo).
         """
         tramo = self.tramo_actual()
         if tramo is None:
             return
 
-        if self._pasos_de_latencia == 0:
+        if self._pasos_actuacion == 0:
             comando_a_aplicar = (izquierda, derecha)
         else:
-            self._cola_comandos.append((izquierda, derecha))
+            # Leer primero el comando más viejo de la cola y recién
+            # después encolar el nuevo: si se encolara antes de leer,
+            # con maxlen=_pasos_actuacion el comando recién emitido
+            # desplazaría al más viejo y se leería a sí mismo en la
+            # misma llamada, dando un paso menos de retardo del
+            # configurado.
             comando_a_aplicar = self._cola_comandos[0]
+            self._cola_comandos.append((izquierda, derecha))
 
         self._actualizar_velocidad_real(comando_a_aplicar[0], comando_a_aplicar[1], dt)
         velocidad_izquierda = self._velocidad_real_izquierda
@@ -307,7 +324,7 @@ class PistaVirtual:
             self.avance_tramo = 0.0
             self.indice_tramo += 1
 
-        if self._pasos_de_latencia > 0:
+        if self._pasos_percepcion > 0:
             self._cola_estado.append((self.posicion_lateral, self.orientacion, self.indice_tramo, self.avance_tramo))
 
     def _con_ruido(self, valor: float, desviacion: float) -> float:
@@ -325,15 +342,15 @@ class PistaVirtual:
     def _estado_observado(self) -> tuple[float, float, int, float]:
         """Devuelve (posicion, orientacion, indice_tramo, avance_tramo)
         tal como los "vería" la visión ahora mismo: el estado real si no
-        hay latencia configurada, o el estado de hace LATENCIA_MS si sí
-        la hay.
+        hay latencia de percepción configurada, o el estado de hace
+        LATENCIA_PERCEPCION_MS si sí la hay.
 
         Recibe: nada.
         Devuelve: tupla con el estado retrasado usado para generar los
             resultados de visión.
         Complejidad: O(1).
         """
-        if self._pasos_de_latencia == 0:
+        if self._pasos_percepcion == 0:
             return self.posicion_lateral, self.orientacion, self.indice_tramo, self.avance_tramo
         return self._cola_estado[0]
 

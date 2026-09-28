@@ -59,10 +59,14 @@ class ControladorPD:
         """Calcula velocidades para girar sobre el propio eje, buscando
         la línea perdida.
 
-        Recibe: direccion (1 para girar hacia la derecha, -1 hacia la
-            izquierda; normalmente el signo del último error válido).
+        Recibe: direccion (signo del último error válido: positivo si la
+            línea estaba a la derecha del centro, negativo si estaba a
+            la izquierda).
         Devuelve: (izquierda, derecha) con VEL_BUSQUEDA y signos
-            opuestos.
+            opuestos, girando hacia el lado donde se vio la línea por
+            última vez. Usa la misma convención que calcular(): rueda
+            izquierda más rápida gira el chasis hacia la derecha, igual
+            que cuando error > 0 hace izquierda > derecha.
         Complejidad: O(1).
         """
         signo = 1 if direccion >= 0 else -1

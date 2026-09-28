@@ -1,19 +1,37 @@
-"""Simulador cinemático simple de la pista y el robot.
+"""Simulador cinemático de la pista y el robot, con las imperfecciones
+del pipeline real: latencia de control, motores con zona muerta e
+inercia, y ruido/fallos de detección.
 
-Permite calibrar el controlador y la máquina de estados sin robot y sin
-visión real. En cada paso, la diferencia entre las velocidades de rueda
-que decide nuestro código cambia la orientación del robot, y la
-orientación cambia su posición lateral respecto a la línea: es un lazo
-cerrado, igual que en la pista física.
+En cada paso, la diferencia entre las velocidades de rueda que decide
+nuestro código cambia la orientación del robot, y la orientación cambia
+su posición lateral respecto a la línea: es un lazo cerrado, igual que
+en la pista física. A eso se le suma:
+
+- Latencia: el comando que mueve las ruedas es el que se emitió hace
+  LATENCIA_MS, no el actual (cola de comandos), y el ResultadoLinea que
+  se entrega al control corresponde a la posición de hace LATENCIA_MS
+  (cola de historial), porque eso es lo que muestra el fotograma que
+  acaba de terminar de procesarse.
+- Motores reales: zona muerta (no arrancan con PWM bajo) e inercia
+  (filtro de primer orden, no saltan al valor ordenado).
+- Ruido y fallos de detección: ruido gaussiano en error/ángulo,
+  confianza reducida ocasional y fotogramas inválidos aunque el robot
+  esté sobre la línea.
+
+Con modo_ideal=True se desactivan las tres imperfecciones (equivalente
+al simulador de la fase anterior), para poder comparar directamente
+contra el simulador realista.
 
 A partir de la posición y orientación simuladas se generan un
-ResultadoLinea y un ResultadoSenales coherentes, con ruido opcional,
-para que se comporten como la salida real de los módulos de visión.
+ResultadoLinea y un ResultadoSenales coherentes con lo que vería la
+visión real.
 """
 
 import random
+from collections import deque
 from dataclasses import dataclass
 
+import config
 from control.contratos import ResultadoLinea, ResultadoSenales
 
 ANCHO_PISTA = 1.0  # Media pista en las mismas unidades que la posición lateral: error=1 significa salirse por el borde.
@@ -22,6 +40,8 @@ GANANCIA_POSICION = 0.8  # Qué tanto cambia la posición lateral por unidad de 
 GANANCIA_CURVATURA = 0.012  # Qué tanto empuja la curvatura del tramo a la posición lateral por unidad de (velocidad de avance × dt).
 DISTANCIA_FRANJA_LEJANA = 0.35  # Fracción de la pista que se "adelanta" para estimar el ángulo (curva próxima).
 ORIENTACION_MAXIMA = 1.5  # Máximo ángulo relativo a la línea (radianes-equivalente); más allá el robot ya está de costado.
+VELOCIDAD_AVANCE_UMBRAL_GIRO = 5.0  # |velocidad_avance| por debajo de este umbral se considera "girando en el sitio" (búsqueda), no avanzando.
+GIRO_BARRIDO_COMPLETO = 1.5  # Cuánta rotación acumulada (en las mismas unidades que orientación × dt) representa un barrido completo de la cámara sobre el terreno al girar buscando la línea.
 
 
 @dataclass
@@ -32,11 +52,18 @@ class Tramo:
     longitud: duración del tramo en segundos simulados.
     curvatura: cuánto se desplaza el centro de la línea por unidad de
         avance (positivo = curva a la derecha, negativo = izquierda).
+    nombre: etiqueta corta para identificar el tramo en las métricas
+        por tramo (p. ej. "curva_cerrada", "s_derecha").
     """
 
     tipo: str
     longitud: float
     curvatura: float = 0.0
+    nombre: str = ""
+
+    def __post_init__(self):
+        if not self.nombre:
+            self.nombre = self.tipo
 
 
 def crear_pista_calibracion() -> list[Tramo]:
@@ -45,39 +72,77 @@ def crear_pista_calibracion() -> list[Tramo]:
     Recibe: nada.
     Devuelve: lista de Tramo con, en orden: recta, curva suave a la
         derecha, curva cerrada a la izquierda, tramo con señal PARE
-        acercándose, tramo con señal SIGA, tramo sin línea (pérdida) y
-        recuperación.
+        acercándose, tramo con señal SIGA, curva muy cerrada (radio
+        mínimo visto en los videos de ensayo), tramo en S (derecha
+        seguida de izquierda), tramo sin línea (pérdida) y recuperación.
     Complejidad: O(1).
     """
     return [
-        Tramo(tipo="recta", longitud=4.0, curvatura=0.0),
-        Tramo(tipo="curva", longitud=6.0, curvatura=0.35),
-        Tramo(tipo="curva", longitud=6.0, curvatura=-0.7),
-        Tramo(tipo="pare", longitud=6.0, curvatura=0.0),
-        Tramo(tipo="recta", longitud=2.0, curvatura=0.0),
-        Tramo(tipo="siga", longitud=4.0, curvatura=0.0),
-        Tramo(tipo="sin_linea", longitud=3.0, curvatura=0.0),
-        Tramo(tipo="recta", longitud=4.0, curvatura=0.0),
+        Tramo(tipo="recta", longitud=4.0, curvatura=0.0, nombre="recta_inicial"),
+        Tramo(tipo="curva", longitud=6.0, curvatura=0.35, nombre="curva_suave_derecha"),
+        Tramo(tipo="curva", longitud=6.0, curvatura=-0.7, nombre="curva_cerrada_izquierda"),
+        Tramo(tipo="pare", longitud=6.0, curvatura=0.0, nombre="pare"),
+        Tramo(tipo="recta", longitud=2.0, curvatura=0.0, nombre="recta_post_pare"),
+        Tramo(tipo="siga", longitud=4.0, curvatura=0.0, nombre="siga"),
+        Tramo(tipo="curva", longitud=4.0, curvatura=1.1, nombre="curva_muy_cerrada"),
+        Tramo(tipo="recta", longitud=1.5, curvatura=0.0, nombre="recta_entre_curvas"),
+        Tramo(tipo="curva", longitud=3.0, curvatura=0.9, nombre="s_derecha"),
+        Tramo(tipo="curva", longitud=3.0, curvatura=-0.9, nombre="s_izquierda"),
+        Tramo(tipo="sin_linea", longitud=3.0, curvatura=0.0, nombre="sin_linea"),
+        Tramo(tipo="recta", longitud=4.0, curvatura=0.0, nombre="recta_final"),
     ]
 
 
 class PistaVirtual:
-    """Modelo cinemático 2D simplificado del robot sobre una pista de
-    tramos, con generación de ResultadoLinea/ResultadoSenales.
+    """Modelo cinemático 2D del robot sobre una pista de tramos, con
+    latencia de control, motores con zona muerta/inercia, ruido y
+    fallos de detección (o sin ninguno de estos, en modo_ideal).
     """
 
-    def __init__(self, tramos: list[Tramo], ruido: float = 0.0, semilla: int | None = None):
+    def __init__(self, tramos: list[Tramo], modo_ideal: bool = False, semilla: int | None = None):
         self.tramos = tramos
-        self.ruido = ruido
-        self.aleatorio = random.Random(semilla)
+        self.modo_ideal = modo_ideal
+        semilla_efectiva = semilla if semilla is not None else config.SEMILLA_SIMULACION
+        self.aleatorio = random.Random(semilla_efectiva)
 
         self.posicion_lateral = 0.0  # 0 = centrado en la línea; -1..1 = hacia el borde.
         self.orientacion = 0.0  # Ángulo relativo a la línea; 0 = alineado.
         self.avance_tramo = 0.0
         self.indice_tramo = 0
         self.distancia_total = 0.0
+        self.tiempo_total = 0.0
         self.fuera_de_pista_eventos = 0
         self._fuera_de_pista_anterior = False
+
+        # Velocidad real de cada rueda tras zona muerta + inercia (lo que
+        # de verdad mueve el chasis), separada del comando recién emitido.
+        self._velocidad_real_izquierda = 0.0
+        self._velocidad_real_derecha = 0.0
+
+        # Rotación acumulada mientras el robot gira en el sitio buscando
+        # la línea (fuera de un tramo "sin_linea" con temporizador
+        # propio): representa cuánto ha barrido la cámara sobre el
+        # terreno, para poder reencontrar la línea sin que la posición
+        # lateral quede congelada para siempre. Se reinicia en cuanto el
+        # robot vuelve a avanzar de verdad.
+        self._rotacion_acumulada_busqueda = 0.0
+
+        if modo_ideal or config.LATENCIA_MS <= 0:
+            self._pasos_de_latencia = 0
+        else:
+            self._pasos_de_latencia = max(1, round(config.LATENCIA_MS / config.PASO_SIMULACION_MS))
+
+        # Cola de comandos pendientes de aplicarse (retardo de actuación) y
+        # de estados pasados pendientes de "observarse" (retardo de
+        # percepción): ambas con la misma profundidad, porque la latencia
+        # del pipeline afecta igual a la salida que a la entrada. Se
+        # inicializan llenas (comando y estado en reposo) para que el
+        # primer LATENCIA_MS de simulación ya tenga de dónde leer.
+        self._cola_comandos = deque([(0, 0)] * self._pasos_de_latencia, maxlen=self._pasos_de_latencia or None)
+        self._cola_estado = deque(
+            [(0.0, 0.0, self.indice_tramo, self.avance_tramo)] * self._pasos_de_latencia,
+            maxlen=self._pasos_de_latencia or None,
+        )
 
     def tramo_actual(self) -> Tramo | None:
         """Devuelve el tramo en el que está el robot, o None si terminó.
@@ -97,19 +162,84 @@ class PistaVirtual:
         """
         return self.tramo_actual() is None
 
+    def _aplicar_zona_muerta(self, velocidad_ordenada: float) -> float:
+        """Aplica la zona muerta del motor a una velocidad ordenada.
+
+        Por debajo de ZONA_MUERTA el motor no arranca (0.0). Por encima,
+        en vez de dejar un salto brusco justo en el umbral (que
+        convertiría una orden pequeña pero real, p. ej. 5, en una
+        diferencia enorme entre ruedas si la otra rueda pide 70), se
+        comprime linealmente [ZONA_MUERTA, VEL_MAX] a [0, VEL_MAX]: la
+        velocidad real crece de forma continua desde 0 apenas se supera
+        el umbral, como en un motor real que sí responde algo distinto
+        cerca de su punto de arranque en vez de un escalón perfecto.
+
+        Recibe: velocidad_ordenada (float, comando de una rueda).
+        Devuelve: float, velocidad tras la zona muerta.
+        Complejidad: O(1).
+        """
+        if self.modo_ideal:
+            return velocidad_ordenada
+
+        signo = 1.0 if velocidad_ordenada >= 0 else -1.0
+        magnitud = abs(velocidad_ordenada)
+        if magnitud < config.ZONA_MUERTA:
+            return 0.0
+
+        rango_util = config.VEL_MAX - config.ZONA_MUERTA
+        if rango_util <= 0:
+            return signo * config.VEL_MAX
+
+        magnitud_comprimida = (magnitud - config.ZONA_MUERTA) * (config.VEL_MAX / rango_util)
+        return signo * min(magnitud_comprimida, config.VEL_MAX)
+
+    def _actualizar_velocidad_real(self, objetivo_izquierda: float, objetivo_derecha: float, dt: float) -> None:
+        """Acerca la velocidad real de cada rueda a su objetivo con un
+        filtro de primer orden (inercia del motor), tras la zona muerta.
+
+        Recibe: objetivo_izquierda, objetivo_derecha (comandos ya
+            retrasados por la latencia) y dt (segundos del paso).
+        Devuelve: nada; actualiza _velocidad_real_izquierda/derecha.
+        Complejidad: O(1).
+        """
+        objetivo_izquierda = self._aplicar_zona_muerta(objetivo_izquierda)
+        objetivo_derecha = self._aplicar_zona_muerta(objetivo_derecha)
+
+        if self.modo_ideal:
+            self._velocidad_real_izquierda = objetivo_izquierda
+            self._velocidad_real_derecha = objetivo_derecha
+            return
+
+        # Filtro exponencial de primer orden: v += (objetivo - v) * dt/tau.
+        factor = min(1.0, dt / config.TAU_MOTOR)
+        self._velocidad_real_izquierda += (objetivo_izquierda - self._velocidad_real_izquierda) * factor
+        self._velocidad_real_derecha += (objetivo_derecha - self._velocidad_real_derecha) * factor
+
     def paso(self, izquierda: int, derecha: int, dt: float) -> None:
         """Avanza la simulación un paso de tiempo dt.
 
         Recibe: izquierda, derecha (velocidades de rueda decididas por
-            el controlador) y dt (segundos).
-        Devuelve: nada; actualiza la posición y orientación internas.
-        Complejidad: O(1).
+            el controlador para ESTE instante) y dt (segundos).
+        Devuelve: nada; encola el comando (se aplicará con retardo de
+            LATENCIA_MS), avanza la cinemática con el comando que le
+            corresponde a este paso según esa cola, y guarda el estado
+            resultante en el historial de observación.
+        Complejidad: O(1) (la cola tiene tamaño fijo).
         """
         tramo = self.tramo_actual()
         if tramo is None:
             return
 
-        velocidad_avance = (izquierda + derecha) / 2.0
+        if self._pasos_de_latencia == 0:
+            comando_a_aplicar = (izquierda, derecha)
+        else:
+            self._cola_comandos.append((izquierda, derecha))
+            comando_a_aplicar = self._cola_comandos[0]
+
+        self._actualizar_velocidad_real(comando_a_aplicar[0], comando_a_aplicar[1], dt)
+        velocidad_izquierda = self._velocidad_real_izquierda
+        velocidad_derecha = self._velocidad_real_derecha
+        velocidad_avance = (velocidad_izquierda + velocidad_derecha) / 2.0
 
         # Mientras la línea está fuera de cuadro (primera mitad del tramo
         # "sin_linea") no hay ninguna referencia visual con la que
@@ -127,15 +257,38 @@ class PistaVirtual:
             # de la posición lateral en vez de sumar (así corrige un error
             # positivo, "línea a la derecha", moviendo el chasis hacia la
             # derecha).
-            diferencia_ruedas = izquierda - derecha
-            self.orientacion += GANANCIA_ORIENTACION * diferencia_ruedas * dt
+            diferencia_ruedas = velocidad_izquierda - velocidad_derecha
+            cambio_orientacion = GANANCIA_ORIENTACION * diferencia_ruedas * dt
+            self.orientacion += cambio_orientacion
             self.orientacion = max(-ORIENTACION_MAXIMA, min(ORIENTACION_MAXIMA, self.orientacion))
 
-            # La posición lateral solo cambia por el rumbo cuando el robot
-            # efectivamente avanza (o retrocede): girar en el sitio, con
-            # velocidad de avance ~0, no debería desplazar el centroide.
-            self.posicion_lateral -= GANANCIA_POSICION * self.orientacion * velocidad_avance * dt
-            self.posicion_lateral += GANANCIA_CURVATURA * tramo.curvatura * velocidad_avance * dt
+            girando_en_sitio = abs(velocidad_avance) < VELOCIDAD_AVANCE_UMBRAL_GIRO and abs(diferencia_ruedas) > 0
+
+            if girando_en_sitio:
+                # El chasis casi no avanza, pero sí rota: la cámara barre
+                # el terreno y, sin importar qué tan lejos haya quedado
+                # el robot, la línea sigue siendo un punto fijo que el
+                # barrido cruza una vez por vuelta. Se acumula cuánto ha
+                # girado y, al completar un barrido, se asume que la
+                # visión ya reencontró la línea: la posición lateral
+                # "salta" a quedar justo dentro del borde de la pista,
+                # del lado en que estaba, lista para que SEGUIR_LINEA
+                # retome el control (sin importar si el robot había
+                # quedado a 1 o a 10 anchos de pista de distancia).
+                self._rotacion_acumulada_busqueda += abs(cambio_orientacion)
+                if self._rotacion_acumulada_busqueda >= GIRO_BARRIDO_COMPLETO:
+                    self._rotacion_acumulada_busqueda = 0.0
+                    signo_posicion = 1.0 if self.posicion_lateral >= 0 else -1.0
+                    self.posicion_lateral = signo_posicion * ANCHO_PISTA * 0.9
+                    self.orientacion = 0.0
+            else:
+                self._rotacion_acumulada_busqueda = 0.0
+                # La posición lateral solo cambia por el rumbo cuando el
+                # robot efectivamente avanza (o retrocede): girar en el
+                # sitio, con velocidad de avance ~0, no debería desplazar
+                # el centroide por sí solo (eso ya lo cubre el barrido).
+                self.posicion_lateral -= GANANCIA_POSICION * self.orientacion * velocidad_avance * dt
+                self.posicion_lateral += GANANCIA_CURVATURA * tramo.curvatura * velocidad_avance * dt
 
             fuera_de_pista = abs(self.posicion_lateral) > ANCHO_PISTA
             if fuera_de_pista and not self._fuera_de_pista_anterior:
@@ -143,6 +296,7 @@ class PistaVirtual:
             self._fuera_de_pista_anterior = fuera_de_pista
 
         self.distancia_total += abs(velocidad_avance) * dt
+        self.tiempo_total += dt
 
         # El progreso dentro del tramo avanza con el tiempo, no con la
         # distancia recorrida: así un tramo "sin_linea" también termina
@@ -153,53 +307,89 @@ class PistaVirtual:
             self.avance_tramo = 0.0
             self.indice_tramo += 1
 
-    def _con_ruido(self, valor: float) -> float:
-        """Agrega ruido uniforme opcional a un valor.
+        if self._pasos_de_latencia > 0:
+            self._cola_estado.append((self.posicion_lateral, self.orientacion, self.indice_tramo, self.avance_tramo))
 
-        Recibe: valor (float). Devuelve: valor perturbado.
+    def _con_ruido(self, valor: float, desviacion: float) -> float:
+        """Agrega ruido gaussiano opcional a un valor.
+
+        Recibe: valor (float) y desviacion (desviación estándar; se
+            ignora si modo_ideal es True o desviacion es 0).
+        Devuelve: valor perturbado.
         Complejidad: O(1).
         """
-        if self.ruido <= 0:
+        if self.modo_ideal or desviacion <= 0:
             return valor
-        return valor + self.aleatorio.uniform(-self.ruido, self.ruido)
+        return valor + self.aleatorio.gauss(0.0, desviacion)
+
+    def _estado_observado(self) -> tuple[float, float, int, float]:
+        """Devuelve (posicion, orientacion, indice_tramo, avance_tramo)
+        tal como los "vería" la visión ahora mismo: el estado real si no
+        hay latencia configurada, o el estado de hace LATENCIA_MS si sí
+        la hay.
+
+        Recibe: nada.
+        Devuelve: tupla con el estado retrasado usado para generar los
+            resultados de visión.
+        Complejidad: O(1).
+        """
+        if self._pasos_de_latencia == 0:
+            return self.posicion_lateral, self.orientacion, self.indice_tramo, self.avance_tramo
+        return self._cola_estado[0]
 
     def generar_resultado_linea(self) -> ResultadoLinea:
-        """Genera un ResultadoLinea coherente con el estado simulado.
+        """Genera un ResultadoLinea coherente con el estado observado
+        (retrasado por la latencia si corresponde), con ruido y fallos
+        de detección opcionales.
 
         Recibe: nada.
         Devuelve: ResultadoLinea con error y angulo derivados de la
-            posición lateral y la orientación, o valida=False si el
-            robot se salió de la pista, o si el tramo actual es
-            "sin_linea" y todavía está en su primera mitad (simula que
-            la línea reaparece, ya buscada, en la segunda mitad del
-            tramo, igual que la señal PARE se confirma a mitad de su
-            tramo en generar_resultado_senales).
+            posición/orientación observadas, o valida=False si el robot
+            (en el instante observado) estaba fuera de la pista, en la
+            primera mitad de un tramo "sin_linea", o si un fallo
+            aleatorio de detección lo marca inválido pese a estar sobre
+            la línea.
         Complejidad: O(1).
         """
-        tramo = self.tramo_actual()
-        linea_ausente = tramo is not None and tramo.tipo == "sin_linea" and self.avance_tramo < tramo.longitud * 0.5
-        if tramo is None or linea_ausente or abs(self.posicion_lateral) > ANCHO_PISTA:
+        posicion, orientacion, indice_tramo, avance_tramo = self._estado_observado()
+        tramo = self.tramos[indice_tramo] if indice_tramo < len(self.tramos) else None
+
+        linea_ausente = tramo is not None and tramo.tipo == "sin_linea" and avance_tramo < tramo.longitud * 0.5
+        fuera_de_pista = abs(posicion) > ANCHO_PISTA
+
+        if tramo is None or linea_ausente or fuera_de_pista:
             return ResultadoLinea(error=0.0, angulo=0.0, confianza=0, valida=False)
 
-        error = self._con_ruido(max(-1.0, min(1.0, self.posicion_lateral / ANCHO_PISTA)))
-        posicion_lejana = self.posicion_lateral + self.orientacion * DISTANCIA_FRANJA_LEJANA
-        angulo = self._con_ruido(max(-1.0, min(1.0, (posicion_lejana - self.posicion_lateral) / ANCHO_PISTA)))
+        if not self.modo_ideal and self.aleatorio.random() < config.PROB_LINEA_INVALIDA:
+            return ResultadoLinea(error=0.0, angulo=0.0, confianza=0, valida=False)
 
-        return ResultadoLinea(error=error, angulo=angulo, confianza=4, valida=True)
+        error = self._con_ruido(max(-1.0, min(1.0, posicion / ANCHO_PISTA)), config.RUIDO_ERROR)
+        posicion_lejana = posicion + orientacion * DISTANCIA_FRANJA_LEJANA
+        angulo = self._con_ruido(max(-1.0, min(1.0, (posicion_lejana - posicion) / ANCHO_PISTA)), config.RUIDO_ANGULO)
+
+        confianza = 4
+        if not self.modo_ideal and self.aleatorio.random() < config.PROB_FRANJA_PERDIDA:
+            confianza = 2
+
+        return ResultadoLinea(error=error, angulo=angulo, confianza=confianza, valida=True)
 
     def generar_resultado_senales(self) -> ResultadoSenales:
-        """Genera un ResultadoSenales coherente con el tramo simulado.
+        """Genera un ResultadoSenales coherente con el tramo observado
+        (retrasado por la latencia si corresponde).
 
         Recibe: nada.
         Devuelve: ResultadoSenales con senal="PARE" o "SIGA" cuando el
-            tramo actual es de ese tipo, marcando en_disparo=True solo
-            en la mitad final del tramo (simula que la señal se acerca).
+            tramo observado es de ese tipo, marcando en_disparo=True
+            solo en la mitad final del tramo (simula que la señal se
+            acerca).
         Complejidad: O(1).
         """
-        tramo = self.tramo_actual()
+        _, _, indice_tramo, avance_tramo = self._estado_observado()
+        tramo = self.tramos[indice_tramo] if indice_tramo < len(self.tramos) else None
+
         if tramo is None or tramo.tipo not in ("pare", "siga"):
             return ResultadoSenales(senal=None, en_disparo=False)
 
         senal = "PARE" if tramo.tipo == "pare" else "SIGA"
-        en_disparo = self.avance_tramo >= tramo.longitud * 0.5
+        en_disparo = avance_tramo >= tramo.longitud * 0.5
         return ResultadoSenales(senal=senal, en_disparo=en_disparo)

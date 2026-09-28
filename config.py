@@ -20,9 +20,9 @@ RUTA_CALIBRACION_CONTROL = os.path.join(os.path.dirname(__file__), "calibracion_
 # CONTROL PD
 # ==========================================================================
 
-KP = 0.9  # Ganancia proporcional: qué tanto giro se aplica por unidad de error lateral.
-KD = 0.15  # Ganancia derivativa: amortigua oscilaciones reaccionando a qué tan rápido cambia el error.
-KA = 0.3  # Ganancia sobre el ángulo estimado: anticipa curvas antes de que crezca el error lateral.
+KP = 20.0  # Ganancia proporcional: qué tanto giro (en unidades de velocidad de rueda) se aplica por unidad de error lateral en [-1, 1].
+KD = 10.0  # Ganancia derivativa: amortigua oscilaciones reaccionando a qué tan rápido cambia el error suavizado.
+KA = 10.0  # Ganancia sobre el ángulo estimado: anticipa curvas antes de que crezca el error lateral.
 
 ALFA_SUAVIZADO = 0.4  # Peso del error nuevo en la media exponencial (0-1). Más alto = menos suavizado.
 

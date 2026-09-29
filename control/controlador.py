@@ -61,6 +61,49 @@ class ControladorPD:
 
         return self._recortar(izquierda), self._recortar(derecha)
 
+    def realinear(self, resultado_linea: ResultadoLinea) -> tuple[int, int]:
+        """Calcula velocidades para girar hacia la línea SIN avanzar,
+        usado en REALINEANDO al recuperar la línea tras una búsqueda.
+
+        A diferencia de calcular(), no hay componente de avance (la
+        velocidad base es 0): un seguidor de línea real que encuentra la
+        línea girando sobre su eje no se lanza hacia adelante estando
+        torcido, sigue girando hasta alinearse. Tampoco usa KD: la
+        alineación es un giro simple, no un seguimiento fino.
+
+        El giro se calcula sobre 'angulo' (orientación estimada del
+        chasis), no sobre 'error' (desplazamiento lateral): girando en
+        el sitio solo se puede corregir el rumbo, nunca la posición
+        lateral, así que apuntar a corregir 'error' aquí no tendría
+        forma de converger. La posición lateral se termina de corregir
+        después, en SEGUIR_LINEA, ya con el chasis derecho.
+
+        A diferencia de calcular() (donde el giro corrige la posición
+        lateral moviendo el chasis HACIA la línea), aquí el objetivo es
+        reducir |angulo| a 0: angulo>0 significa que el chasis ya está
+        girado hacia ese lado, así que hay que girar en el sentido
+        CONTRARIO para deshacerlo, no reforzarlo. Por eso el signo del
+        giro es opuesto al de calcular() para el mismo campo.
+
+        Recibe: resultado_linea (ResultadoLinea con angulo en [-1, 1];
+            se asume valida=True, ya se comprobó antes de llamar).
+        Devuelve: (izquierda, derecha) en enteros, con velocidad de
+            avance nula y solo componente de giro proporcional al ángulo,
+            con un piso de VEL_MIN_REALINEACION para no caer en zona
+            muerta con ángulos pequeños (ver comentario en config.py).
+        Complejidad: O(1).
+        """
+        if resultado_linea.angulo == 0:
+            return 0, 0
+
+        giro = -config.KP_REALINEACION * resultado_linea.angulo
+        signo = 1.0 if giro >= 0 else -1.0
+        giro = signo * max(abs(giro), config.VEL_MIN_REALINEACION)
+
+        izquierda = giro
+        derecha = -giro
+        return self._recortar(izquierda), self._recortar(derecha)
+
     def girar_en_sitio(self, direccion: int) -> tuple[int, int]:
         """Calcula velocidades para girar sobre el propio eje, buscando
         la línea perdida.

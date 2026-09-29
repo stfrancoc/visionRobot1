@@ -38,12 +38,20 @@ from dataclasses import dataclass
 import config
 from control.contratos import ResultadoLinea, ResultadoSenales
 
+# CALIBRAR CON VIDEO: esta escala completa (ANCHO_PISTA y las ganancias
+# cinemáticas de abajo) es arbitraria, no está anclada a centímetros
+# reales ni al ancho de la ROI de la cámara. Es una limitación conocida
+# del simulador (ver capturas/reporte_calibracion.md): el punto en que
+# error=1.0 (línea "en el borde") no corresponde a una distancia física
+# verificada, así que el error de reingreso tras LINEA_PERDIDA no es
+# representativo del robot real hasta que esto se recalibre contra
+# video.
 ANCHO_PISTA = 1.0  # Media pista en las mismas unidades que la posición lateral: error=1 significa salirse por el borde.
-GANANCIA_ORIENTACION = 0.05  # Qué tanto cambia la orientación por unidad de diferencia de ruedas y de dt.
-GANANCIA_POSICION = 0.8  # Qué tanto cambia la posición lateral por unidad de (orientación × velocidad de avance × dt).
-GANANCIA_CURVATURA = 0.012  # Qué tanto empuja la curvatura del tramo a la posición lateral por unidad de (velocidad de avance × dt).
-DISTANCIA_FRANJA_LEJANA = 0.35  # Fracción de la pista que se "adelanta" para estimar el ángulo (curva próxima).
-ORIENTACION_MAXIMA = 1.5  # Máximo ángulo relativo a la línea (radianes-equivalente) durante seguimiento normal; más allá el robot ya está de costado.
+GANANCIA_ORIENTACION = 0.05  # CALIBRAR CON VIDEO. Qué tanto cambia la orientación por unidad de diferencia de ruedas y de dt.
+GANANCIA_POSICION = 0.8  # CALIBRAR CON VIDEO. Qué tanto cambia la posición lateral por unidad de (orientación × velocidad de avance × dt).
+GANANCIA_CURVATURA = 0.012  # CALIBRAR CON VIDEO. Qué tanto empuja la curvatura del tramo a la posición lateral por unidad de (velocidad de avance × dt).
+DISTANCIA_FRANJA_LEJANA = 0.35  # CALIBRAR CON VIDEO. Fracción de la pista que se "adelanta" para estimar el ángulo (curva próxima).
+ORIENTACION_MAXIMA = 1.5  # CALIBRAR CON VIDEO. Máximo ángulo relativo a la línea (radianes-equivalente) durante seguimiento normal; más allá el robot ya está de costado.
 VELOCIDAD_AVANCE_UMBRAL_GIRO = 5.0  # |velocidad_avance| por debajo de este umbral se considera "girando en el sitio" (búsqueda), no avanzando.
 
 # Campo de visión angular de la cámara (misma escala arbitraria que
@@ -309,18 +317,29 @@ class PistaVirtual:
                 # vuelve a acercarse a 0 desde el lado opuesto, cruzando
                 # de nuevo ANGULO_CAMPO_VISION de forma continua.
                 self.orientacion = (self.orientacion + VUELTA_COMPLETA / 2) % VUELTA_COMPLETA - VUELTA_COMPLETA / 2
+
+                # Un giro sobre el propio eje (ruedas a velocidades
+                # opuestas) no traslada el chasis: la velocidad de avance
+                # neta es ~0 solo en estado estacionario, pero durante el
+                # transitorio de inercia al entrar/salir del giro (o con
+                # el margen que da VELOCIDAD_AVANCE_UMBRAL_GIRO) puede
+                # quedar un residuo no nulo que, multiplicado por una
+                # orientación ya grande o por la curvatura del tramo,
+                # desplazaba la posición lateral de forma sostenida
+                # mientras el robot "buscaba" sin moverse realmente. Por
+                # eso aquí NO se actualiza posicion_lateral: solo cambia
+                # el rumbo, nunca la posición.
             else:
                 # El límite de ORIENTACION_MAXIMA solo aplica en
                 # seguimiento normal, para que el ángulo reportado no se
                 # dispare mientras se sigue la línea.
                 self.orientacion = max(-ORIENTACION_MAXIMA, min(ORIENTACION_MAXIMA, self.orientacion))
 
-            # La posición lateral cambia por el rumbo y por la curvatura
-            # del tramo en todo momento (también al girar en el sitio,
-            # donde velocidad_avance es ~0 y por lo tanto este término se
-            # anula naturalmente sin necesitar un caso especial).
-            self.posicion_lateral -= GANANCIA_POSICION * self.orientacion * velocidad_avance * dt
-            self.posicion_lateral += GANANCIA_CURVATURA * tramo.curvatura * velocidad_avance * dt
+                # La posición lateral solo cambia con la componente de
+                # avance real (seguimiento normal); en giro puro es nula
+                # y se deja congelada, como en el chasis físico.
+                self.posicion_lateral -= GANANCIA_POSICION * self.orientacion * velocidad_avance * dt
+                self.posicion_lateral += GANANCIA_CURVATURA * tramo.curvatura * velocidad_avance * dt
 
             fuera_de_pista = abs(self.posicion_lateral) > ANCHO_PISTA
             if fuera_de_pista and not self._fuera_de_pista_anterior:

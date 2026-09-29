@@ -81,6 +81,37 @@ class PruebasControladorPD(unittest.TestCase):
         self.assertEqual(izquierda, -derecha)
         self.assertNotEqual(izquierda, 0)
 
+    def test_realinear_no_avanza(self):
+        resultado = ResultadoLinea(error=0.9, angulo=0.5, confianza=4, valida=True)
+        izquierda, derecha = self.controlador.realinear(resultado)
+        self.assertEqual(izquierda + derecha, 0)
+
+    def test_realinear_angulo_cero_no_gira(self):
+        resultado = ResultadoLinea(error=0.9, angulo=0.0, confianza=4, valida=True)
+        izquierda, derecha = self.controlador.realinear(resultado)
+        self.assertEqual((izquierda, derecha), (0, 0))
+
+    def test_realinear_respeta_piso_minimo_con_angulo_pequeno(self):
+        # Un ángulo pequeño no debe producir un comando por debajo de
+        # ZONA_MUERTA: el motor real no reaccionaría y el chasis
+        # quedaría a merced de la inercia residual del giro anterior
+        # (ver VEL_MIN_REALINEACION en config.py).
+        resultado = ResultadoLinea(error=0.9, angulo=0.05, confianza=4, valida=True)
+        izquierda, derecha = self.controlador.realinear(resultado)
+        self.assertGreaterEqual(abs(izquierda), config.VEL_MIN_REALINEACION)
+
+    def test_realinear_gira_en_sentido_contrario_al_angulo(self):
+        # angulo>0 significa que el chasis ya está girado hacia ese
+        # lado: para deshacerlo (llevar el ángulo a 0) hay que girar en
+        # el sentido CONTRARIO, no reforzarlo como haría calcular() para
+        # corregir una posición lateral.
+        positivo = ResultadoLinea(error=0.9, angulo=0.05, confianza=4, valida=True)
+        negativo = ResultadoLinea(error=0.9, angulo=-0.05, confianza=4, valida=True)
+        izquierda_pos, derecha_pos = self.controlador.realinear(positivo)
+        izquierda_neg, derecha_neg = self.controlador.realinear(negativo)
+        self.assertGreater(derecha_pos, izquierda_pos)
+        self.assertGreater(izquierda_neg, derecha_neg)
+
 
 if __name__ == "__main__":
     unittest.main()

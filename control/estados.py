@@ -3,11 +3,17 @@
 Combina las salidas de visión (ResultadoLinea, ResultadoSenales) con el
 ControladorPD para decidir, en cada fotograma, qué ComandoRobot enviar.
 Implementa los estados y transiciones de la sección 3.4 del README:
-SEGUIR_LINEA, PARE, REANUDAR, SIGA y LINEA_PERDIDA. Se agrega un estado
-adicional DETENIDO, al que se llega solo si LINEA_PERDIDA agota
-TIEMPO_MAX_PERDIDA: mantiene las ruedas en cero y no se abandona solo,
-porque "detenerse y reportarlo" debe ser un estado final visible y no
-una vuelta silenciosa a SEGUIR_LINEA.
+SEGUIR_LINEA, PARE, REANUDAR, SIGA y LINEA_PERDIDA. Se agregan dos
+estados adicionales:
+- REALINEANDO: intermedio entre LINEA_PERDIDA y SEGUIR_LINEA. Al
+  recuperar la línea girando en sitio, el chasis suele estar todavía
+  torcido; avanzar de inmediato a velocidad normal lo saca de la pista
+  en uno o dos fotogramas. Un seguidor de línea real sigue girando (sin
+  avanzar) hasta quedar alineado, y solo entonces retoma el seguimiento.
+- DETENIDO: al que se llega solo si LINEA_PERDIDA agota
+  TIEMPO_MAX_PERDIDA: mantiene las ruedas en cero y no se abandona solo,
+  porque "detenerse y reportarlo" debe ser un estado final visible y no
+  una vuelta silenciosa a SEGUIR_LINEA.
 
 El tiempo siempre llega como parámetro (tiempo_actual); esta clase nunca
 llama a time.time(), para poder probarla con secuencias simuladas.
@@ -22,6 +28,7 @@ PARE = "PARE"
 REANUDAR = "REANUDAR"
 SIGA = "SIGA"
 LINEA_PERDIDA = "LINEA_PERDIDA"
+REALINEANDO = "REALINEANDO"
 DETENIDO = "DETENIDO"
 
 
@@ -37,6 +44,7 @@ class MaquinaEstados:
         self.tiempo_entrada_estado = 0.0
         self.tiempo_anterior = None
         self.eventos = []
+        self.fotogramas_alineados = 0  # Racha de fotogramas consecutivos con |error| < ERROR_REALINEADO, dentro de REALINEANDO.
 
     def actualizar(
         self,
@@ -65,6 +73,7 @@ class MaquinaEstados:
             REANUDAR: self._en_reanudar,
             SIGA: self._en_siga,
             LINEA_PERDIDA: self._en_linea_perdida,
+            REALINEANDO: self._en_realineando,
             DETENIDO: self._en_detenido,
         }[self.estado]
 
@@ -133,15 +142,43 @@ class MaquinaEstados:
 
         return self.controlador.calcular(resultado_linea, dt)
 
+    def _en_realineando(self, resultado_linea, resultado_senales, tiempo_actual, dt):
+        if not resultado_linea.valida:
+            self.fotogramas_alineados = 0
+            self._cambiar_estado(LINEA_PERDIDA, tiempo_actual, "línea perdida de nuevo en REALINEANDO")
+            return self.controlador.girar_en_sitio(self.signo_ultimo_error)
+
+        if tiempo_actual - self.tiempo_entrada_estado >= config.TIEMPO_MAX_REALINEANDO:
+            self.fotogramas_alineados = 0
+            self._cambiar_estado(LINEA_PERDIDA, tiempo_actual, "tiempo máximo de realineación agotado")
+            return self.controlador.girar_en_sitio(self.signo_ultimo_error)
+
+        # Se mide sobre el ángulo (rumbo), no sobre el error de posición:
+        # con avance nulo el robot solo corrige orientación girando, la
+        # posición lateral queda fija hasta que se retome el avance en
+        # SEGUIR_LINEA (ver comentario de ERROR_REALINEADO en config.py).
+        if abs(resultado_linea.angulo) < config.ERROR_REALINEADO:
+            self.fotogramas_alineados += 1
+        else:
+            self.fotogramas_alineados = 0
+
+        if self.fotogramas_alineados >= config.FOTOGRAMAS_REALINEADO_CONSECUTIVOS:
+            self.fotogramas_alineados = 0
+            self.controlador.reiniciar()
+            self._cambiar_estado(SEGUIR_LINEA, tiempo_actual, "alineación confirmada")
+            return self.controlador.calcular(resultado_linea, dt)
+
+        return self.controlador.realinear(resultado_linea)
+
     def _en_siga(self, resultado_linea, resultado_senales, tiempo_actual, dt):
         self._cambiar_estado(SEGUIR_LINEA, tiempo_actual, "evento SIGA registrado")
         return self.controlador.calcular(resultado_linea, dt)
 
     def _en_linea_perdida(self, resultado_linea, resultado_senales, tiempo_actual, dt):
         if resultado_linea.valida:
-            self.controlador.reiniciar()
-            self._cambiar_estado(SEGUIR_LINEA, tiempo_actual, "línea recuperada")
-            return self.controlador.calcular(resultado_linea, dt)
+            self.fotogramas_alineados = 0
+            self._cambiar_estado(REALINEANDO, tiempo_actual, "línea recuperada, realineando antes de avanzar")
+            return self.controlador.realinear(resultado_linea)
 
         if tiempo_actual - self.tiempo_entrada_estado >= config.TIEMPO_MAX_PERDIDA:
             self._cambiar_estado(DETENIDO, tiempo_actual, "tiempo máximo de línea perdida agotado, se detiene")

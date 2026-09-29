@@ -17,10 +17,20 @@ from dataclasses import dataclass, field
 UMBRAL_OSCILACION = 0.05  # |error| mínimo (en ambos lados del cruce por cero) para contarlo como oscilación real y no como ruido de asentamiento.
 
 # Estados de MaquinaEstados donde el robot está efectivamente siguiendo
-# la línea (o parado a propósito por una señal, lo cual no es una
-# falla): el resto (LINEA_PERDIDA, DETENIDO) cuenta como "fuera de
-# seguimiento" para la métrica de desempeño global.
-ESTADOS_EN_SEGUIMIENTO = frozenset({"SEGUIR_LINEA", "REANUDAR", "SIGA", "PARE"})
+# la línea (o parado a propósito por una señal, o realineándose tras
+# recuperarla, lo cual no es una falla sino el mecanismo correcto de
+# recuperación): el resto (LINEA_PERDIDA, DETENIDO) cuenta como "fuera
+# de seguimiento" para la métrica de desempeño global. REALINEANDO
+# cuenta como productivo pero, a diferencia de los demás, no aporta al
+# error_medio (ver registrar_paso): mientras se alinea el error puede
+# seguir siendo grande a propósito, y promediarlo ahí distorsionaría la
+# métrica de qué tan bien se sigue la línea en régimen normal.
+ESTADOS_EN_SEGUIMIENTO = frozenset({"SEGUIR_LINEA", "REANUDAR", "SIGA", "PARE", "REALINEANDO"})
+
+# Subconjunto de ESTADOS_EN_SEGUIMIENTO donde tiene sentido acumular el
+# error para error_medio/salidas_de_pista: en REALINEANDO el error alto
+# es esperado (todavía se está alineando), no una falla de seguimiento.
+ESTADOS_DE_ERROR_NORMAL = frozenset({"SEGUIR_LINEA", "REANUDAR", "SIGA", "PARE"})
 
 PESO_TIEMPO_FUERA_DE_SEGUIMIENTO = 2.0  # Penalización, en la puntuación global, por cada segundo fuera de ESTADOS_EN_SEGUIMIENTO (LINEA_PERDIDA/DETENIDO): el peor desenlace posible.
 
@@ -114,7 +124,10 @@ class RecolectorMetricas:
         # sentido en fotogramas de seguimiento normal: un fotograma
         # inválido durante LINEA_PERDIDA no es "sin error", es
         # directamente peor y ya queda capturado por tiempo_por_estado.
-        if error_valido is None or estado not in ESTADOS_EN_SEGUIMIENTO:
+        # REALINEANDO cuenta como tiempo en seguimiento (no es una
+        # falla) pero se excluye aquí también: ahí el error alto es
+        # esperado mientras se termina de alinear.
+        if error_valido is None or estado not in ESTADOS_DE_ERROR_NORMAL:
             return
 
         tramo.errores.append(abs(error_valido))

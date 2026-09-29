@@ -1,64 +1,368 @@
 """Configuración centralizada del proyecto.
 
 Aquí viven todos los parámetros ajustables para que ningún módulo tenga
-números mágicos. Este archivo solo contiene, por ahora, las secciones de
-control y máquina de estados (rama feature/control-movimiento). Las
-secciones de visión (línea, señales, cámara) las agregan los compañeros
-responsables de esas fases.
+números mágicos.
 
-Si existe `calibracion_control.json` en la raíz del proyecto, sus valores
-tienen prioridad sobre los de esta sección (ver simulador/visor.py, que lo
-genera al presionar 'g').
+Si existen `calibracion_control.json` y/o `calibracion.json` en la raíz
+del proyecto, sus valores tienen prioridad sobre los de este archivo:
+- calibracion_control.json lo genera simulador/visor.py (tecla 'g').
+- calibracion.json lo genera calibrar.py (tecla 'g'), con los
+  parámetros de visión (ROI, umbral de línea, rangos HSV de señales).
+Se cargan en ese orden; si una misma clave estuviera en ambos archivos
+(no debería pasar, cubren secciones distintas), gana calibracion.json
+por cargarse después.
 """
 
 import json
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 RUTA_CALIBRACION_CONTROL = os.path.join(os.path.dirname(__file__), "calibracion_control.json")
+RUTA_CALIBRACION_VISION = os.path.join(os.path.dirname(__file__), "calibracion.json")
 
 # ==========================================================================
-# CONTROL PD
+# VISIÓN — CAPTURA (vision/captura.py)
 # ==========================================================================
 
-# CALIBRAR CON VIDEO: provisionales, calibradas con
-# simulador/calibrar_ganancias.py sobre el simulador REALISTA (latencia
-# total=150ms repartida en percepción+actuación, motores con zona
-# muerta/inercia, ruido de detección), no con datos reales de la visión.
-# Del último barrido (364 combinaciones, tras agregar el estado
-# REALINEANDO) se eligió deliberadamente la combinación más conservadora
-# — menor cantidad de salidas de pista y menor oscilación — en vez de la
-# de mayor porcentaje de tiempo en seguimiento: el simulador todavía
-# sobreestima el error de reingreso tras perder la línea (ver
-# capturas/reporte_calibracion.md), así que optimizar agresivamente
-# contra ese error no es confiable. Deberán recalibrarse en cuanto haya
-# video real.
-KP = 10.0  # Ganancia proporcional: qué tanto giro (en unidades de velocidad de rueda) se aplica por unidad de error lateral en [-1, 1].
-KD = 15.0  # Ganancia derivativa: amortigua oscilaciones reaccionando a qué tan rápido cambia el error suavizado.
-KA = 15.0  # Ganancia sobre el ángulo estimado: anticipa curvas antes de que crezca el error lateral.
+# Origen de video por defecto para main.py/scripts de prueba: ruta de
+# archivo, URL de stream del teléfono (p. ej. IP Webcam) o índice de
+# cámara local (0, 1, ...). FuenteVideo acepta cualquiera de los tres;
+# esto solo fija con cuál arrancar si no se indica otro por argumento.
+# CALIBRAR CON VIDEO/ROBOT: la URL real depende de la red del teléfono
+# en el momento de la prueba.
+FUENTE_VIDEO_URL = os.getenv("CAMERA_URL", "http://192.168.1.10:8080/video")
+
+# Cuántos fotogramas "viejos" puede acumular como máximo el buffer
+# interno de OpenCV antes de que el hilo lector los descarte: con una
+# fuente en vivo (URL o cámara), leer más lento que la fuente produce
+# genera fotogramas cada vez más retrasados si no se descartan
+# activamente. Se conserva solo el más reciente en todo momento.
+TAMANO_BUFFER_LECTOR = 1
+
+# Cuántos milisegundos espera el hilo lector antes de reintentar si la
+# fuente en vivo no entrega un fotograma nuevo (URL caída, cámara
+# ocupada). Evita que el hilo consuma CPU en un bucle apretado inútil.
+ESPERA_REINTENTO_LECTOR_MS = 20
+
+# Rotación aplicada al fotograma justo después de leerlo, ANTES de
+# cualquier otro procesamiento: el teléfono puede guardar el video en
+# vertical pero algunos backends de video reproducen el contenido
+# "acostado" (la orientación queda solo como metadato, no rotada en los
+# píxeles). Valores válidos: 0 (sin rotación), 90, 180, 270 (grados en
+# sentido horario). CALIBRAR CON VIDEO: depende del teléfono y del
+# backend de video de cada máquina, se verifica con
+# pruebas/probar_captura_preprocesamiento.py.
+ROTACION = 0
+
+ANCHO_PROCESO = 480  # Ancho (px) al que se redimensiona el fotograma para el resto del pipeline, manteniendo la proporción original. Bajarlo acelera todo el procesamiento; subirlo da más detalle a costa de latencia.
+
+KERNEL_GAUSSIANO = 5  # Tamaño (impar) del kernel de GaussianBlur para atenuar ruido antes de segmentar. CALIBRAR CON VIDEO.
+
+# Fila (en el fotograma YA redimensionado a ANCHO_PROCESO, medida desde
+# arriba) a partir de la cual empieza a verse el chasis del propio
+# robot: el teléfono va montado sobre el mBot mirando adelante y abajo,
+# así que el tercio inferior del cuadro es chasis y baterías, no piso.
+# Las baterías (verdes) son un falso positivo directo para la
+# detección de SIGA (también verde) si no se descartan primero. Todo lo
+# que esté en fila >= FILA_CHASIS se recorta y nunca llega a las ROI de
+# línea ni de señales.
+#
+# Nota sobre la escena real (confirmada viendo videos/correctos/ y
+# videos/fallos/): la pista es una superficie blanca con una línea
+# negra ancha vista de frente, NO un piso en perspectiva que se
+# estreche a lo lejos como se asumió al principio. La línea es visible
+# y útil en casi toda la altura del cuadro hasta donde la tapan el
+# chasis y, ANTES que las aletas, el sensor ultrasónico: sus dos aros
+# plateados reflejan la luz de forma desigual y generan sombras/brillos
+# que la máscara línea/piso puede confundir con línea (se observó esto
+# directamente: con FILA_CHASIS=0.6 aparecían dos manchas oscuras
+# falsas en las esquinas de la franja más cercana al robot, una de las
+# cuales llegó a "ganarle" a la línea real en la selección por
+# cercanía). Por eso el límite se fija ANTES del sensor, no solo antes
+# de las aletas. CALIBRAR CON VIDEO: depende de dónde quede montado el
+# teléfono en cada robot; medido aquí sobre video4.mp4 fotograma 407,
+# el sensor empieza a aparecer alrededor de 0.55-0.56.
+FILA_CHASIS = 0.53  # Fracción de la altura del fotograma (en [0, 1]), no píxeles absolutos: así no depende de ANCHO_PROCESO/la resolución original.
+
+# La ROI de línea y la ROI de señales son dos recortes verticales
+# distintos del mismo fotograma ya sin el chasis, expresados como
+# fracciones de la altura disponible (entre 0 arriba y FILA_CHASIS
+# abajo), no en píxeles, por la misma razón que FILA_CHASIS. Se
+# solapan a propósito en la franja donde suelen aparecer las señales
+# (que están cerca de la línea, no lejos de ella en esta escena): cada
+# módulo busca algo distinto ahí, no hay conflicto en que ambas ROI
+# cubran esa zona. CALIBRAR CON VIDEO.
+ROI_LINEA_INICIO = 0.0  # Fracción de la altura disponible donde empieza la ROI de línea: la línea es útil en casi toda la altura, no solo cerca del chasis (a diferencia de un piso en perspectiva).
+ROI_LINEA_FIN = 1.0  # Fracción de la altura disponible donde termina la ROI de línea (coincide con FILA_CHASIS: es el límite inferior utilizable).
+ROI_SENALES_INICIO = 0.0  # Fracción de la altura disponible donde empieza la ROI de señales.
+ROI_SENALES_FIN = 0.6  # Fracción de la altura disponible donde termina la ROI de señales: las señales aparecen cerca de la línea, más abajo de lo asumido originalmente.
+
+# ==========================================================================
+# VISIÓN — UMBRAL ADAPTATIVO (vision/umbral_kmeans.py)
+# ==========================================================================
+
+TAMANO_MUESTRA_KMEANS = 500  # Cuántos píxeles de la ROI se muestrean al azar para ajustar K-Means: no hace falta usar todos los píxeles para separar dos grupos bien distintos (línea/piso).
+
+# Cuántas veces corre K-Means con centroides iniciales distintos, se
+# queda con el mejor. Es el parámetro que más determina el costo de
+# calcular_umbral(): medido sobre videos/correctos/ completos, cada
+# corrida de K-Means (incluso con TAMANO_MUESTRA_KMEANS ya bajo) tarda
+# ~7-10ms por inicialización (el overhead fijo de sklearn por llamada,
+# no el ajuste en sí: bajar la muestra de 500 a 80 casi no cambia el
+# tiempo). n_init=5 daba picos de latencia de vision/linea.py de hasta
+# ~55ms, que superaban el umbral de latencia total encontrado en la
+# calibración del simulador. n_init=1 bajaba el pico a ~14ms pero en
+# un fotograma de video1.mp4 (línea casi saliendo del cuadro, poca
+# separación línea/piso) dio un umbral 53 unidades distinto al de
+# n_init=5 — un caso raro pero real de mala inicialización. n_init=2
+# es el punto intermedio: conserva una segunda inicialización como
+# red de seguridad contra ese caso, y baja el pico a ~40ms. CALIBRAR
+# CON VIDEO si el umbral sale inestable entre fotogramas parecidos.
+KMEANS_N_INIT = 2
+KMEANS_SEMILLA = 42  # Semilla fija: mismo fotograma da siempre el mismo umbral (reproducible para depurar).
+
+# Si los dos centroides de K-Means quedan más cerca que esto (en la
+# escala de gris 0-255), no hay separación clara línea/piso en este
+# fotograma (p. ej. la línea salió del cuadro, o el ruido domina la
+# ROI): calcular_umbral() devuelve None y quien llama conserva el
+# umbral anterior en vez de adoptar uno sin significado.
+DIFERENCIA_MINIMA_CENTROIDES = 30  # CALIBRAR CON VIDEO.
+
+# Cada cuántos fotogramas se recalcula el umbral con K-Means, en vez de
+# reutilizar el último válido: K-Means sobre una muestra no es gratis
+# (ver KMEANS_N_INIT arriba), y la iluminación no cambia de un
+# fotograma al siguiente lo bastante rápido como para necesitar
+# recalcularlo cada vez. Subido de 10 a 30 (a ~20 fps, cada ~1.5s en
+# vez de cada ~0.5s): con 10, el pico de K-Means aparecía 1 de cada 10
+# fotogramas y dominaba la latencia p95 del ciclo completo (~23ms);
+# con 30 aparece 3 veces menos seguido sin que se haya observado
+# ningún caso, en los videos disponibles, donde la iluminación
+# cambiara lo bastante en 1.5s como para necesitar un umbral más
+# reciente. CALIBRAR CON VIDEO/ROBOT: si la pista real tiene sombras
+# que se muevan más rápido que esto (p. ej. por luz solar directa),
+# bajar de nuevo.
+PERIODO_KMEANS = 30
+
+# ==========================================================================
+# VISIÓN — DETECCIÓN DE LÍNEA (vision/linea.py)
+# ==========================================================================
+
+# En cuántas franjas horizontales se divide la ROI de línea para
+# estimar su trayectoria. Más franjas dan una estimación más fina del
+# ángulo, pero cada franja tiene menos alto y por lo tanto más ruido en
+# su propia proyección por columnas.
+N_FRANJAS = 6  # CALIBRAR CON VIDEO.
+
+# Tamaño del kernel para las operaciones morfológicas (apertura y
+# cierre) que limpian la máscara binaria línea/piso: la apertura quita
+# puntos sueltos de ruido, el cierre rellena huecos pequeños dentro de
+# la línea (p. ej. por un reflejo).
+KERNEL_MORFOLOGICO = 5  # CALIBRAR CON VIDEO.
+
+# Al analizar cada franja, se descartan los tramos continuos de
+# columnas con línea que sean más angostos que ANCHO_MIN_PX (ruido
+# suelto, no la línea real) o cuyo ÁREA (no su ancho de bounding box)
+# supere ANCHO_EQUIVALENTE_MAX_PX × altura_de_la_franja.
+#
+# Se filtra por ÁREA y no por ancho de bbox a propósito: una línea
+# inclinada dentro de una franja proyecta un bounding box mucho más
+# ancho que su grosor real (un tramo de 70px de grosor inclinado ~45°
+# proyecta cerca de 140px de ancho), pero su ÁREA no cambia con la
+# inclinación — es geometría normal, no ruido, y un filtro por ancho de
+# bbox la descartaba por error (bug encontrado con video1.mp4: la
+# línea real, inclinada, medía 139px de bbox y se descartaba, dejando
+# como único candidato un reflejo de 24px). El área normalizada por la
+# altura de franja ("ancho equivalente") sí distingue bien ambos casos:
+# medido sobre videos/correctos/ completos (video1, video2, video4;
+# ~9300 tramos), la línea real da un ancho equivalente con p50=64,
+# p90=86, p95=106, p99=190px; una franja transversal de señal, al
+# llenar por completo su bounding box, da un ancho equivalente igual a
+# su ancho real (~480px con la ROI completa) — muy por encima de
+# cualquier línea real inclinada. CALIBRAR CON VIDEO si la línea real
+# es de otro grosor.
+ANCHO_EQUIVALENTE_MAX_PX = 200  # Cubre hasta ~p99.3 de lo medido; los casos más extremos de la cola quedan atrapados por UMBRAL_CONTINUIDAD_PX en vez de por este filtro.
+ANCHO_MIN_PX = 8  # Un tramo más angosto que esto se descarta (ruido, no la línea).
+
+# Cuando una franja tiene varios tramos válidos a la vez (línea real +
+# ruido angosto, p. ej. un reflejo del sensor ultrasónico o del borde
+# de la ROI), se descartan los que sean más angostos (por ancho
+# equivalente, ver arriba) que este factor multiplicado por el tramo
+# MÁS ANCHO de esa misma franja, antes de elegir por cercanía a la
+# franja anterior. Sin esto, un tramo de ruido puede "ganarle" a la
+# línea real si por casualidad queda más cerca de una referencia que ya
+# venía desviada. CALIBRAR CON VIDEO.
+PROPORCION_MINIMA_ANCHO_CANDIDATO = 0.5
+
+# Continuidad entre franjas: si el centro elegido en una franja se
+# aleja de la franja vecina ya confirmada más que este umbral (en
+# píxeles), se descarta esa franja (queda None) EN VEZ de aceptarla, y
+# su centro no se usa como referencia para la franja siguiente ni para
+# el próximo fotograma (evita que un engancho a ruido se autoconfirme:
+# si se usara igual como referencia, el error se propaga porque cada
+# fotograma parte del resultado del anterior). Medido sobre los mismos
+# tramos válidos de arriba: el salto entre franjas consecutivas reales
+# tiene p50=28px, p95=79px, p97=82px, y salta a p99=343px — ese salto
+# grande es la firma de un engancho a ruido, no de una curva real.
+# CALIBRAR CON VIDEO.
+UMBRAL_CONTINUIDAD_PX = 120
+
+# Cuántas franjas válidas (con un tramo de línea aceptado) hacen falta,
+# de las N_FRANJAS totales, para considerar el fotograma válido en su
+# conjunto. Con muy pocas franjas válidas la estimación de ángulo/error
+# es poco confiable.
+FRANJAS_MINIMAS_VALIDAS = 2  # CALIBRAR CON VIDEO.
+
+# ==========================================================================
+# VISIÓN — DETECCIÓN DE SEÑALES (vision/senales.py)
+# ==========================================================================
+#
+# Los videos de ensayo (videos/correctos/, videos/fallos/) NO traen las
+# señales definitivas: tienen cuadrados rosados y verdes de pruebas
+# anteriores del equipo, que no sirven para calibrar ni color ni forma
+# (el rosado y el rojo de la señal real son colores de matiz distinto,
+# y un cuadrado no es un octágono). Las señales reales son octágonos
+# rojo y verde con texto PARE/SIGA en blanco y borde oscuro (ver imagen
+# de referencia). Todos los valores de esta sección se calibraron con
+# esa imagen y con octágonos sintéticos, NUNCA con los cuadrados de los
+# videos. CALIBRAR CON VIDEO REAL cuando existan señales definitivas.
+
+# Rango de matiz (H, en la escala 0-179 de OpenCV) para el rojo de la
+# señal PARE. El rojo cruza el 0 en la rueda de color, así que se cubren
+# dos rangos (0-10 y 170-179) y se unen con bitwise_or.
+ROJO_H_BAJO_1 = 0  # CALIBRAR CON VIDEO REAL.
+ROJO_H_ALTO_1 = 10  # CALIBRAR CON VIDEO REAL.
+ROJO_H_BAJO_2 = 170  # CALIBRAR CON VIDEO REAL.
+ROJO_H_ALTO_2 = 179  # CALIBRAR CON VIDEO REAL.
+ROJO_S_MIN = 80  # Saturación mínima: descarta rosados/grises pálidos que compartan matiz con el rojo pero no su intensidad de color. CALIBRAR CON VIDEO REAL.
+ROJO_V_MIN = 50  # Valor (brillo) mínimo: descarta rojos casi negros por sombra. CALIBRAR CON VIDEO REAL.
+
+# Rango de matiz para el verde de la señal SIGA. Se limita a 55-85
+# (sin llegar a 85 de sobra) para no invadir el cian: el chasis/carcasa
+# del mBot en varios videos tiene tonos azul-cian que si se incluyeran
+# generarían falsos positivos de SIGA.
+VERDE_H_BAJO = 55  # CALIBRAR CON VIDEO REAL.
+VERDE_H_ALTO = 85  # CALIBRAR CON VIDEO REAL. No subir de 85: ahí empieza el cian del chasis.
+VERDE_S_MIN = 80  # CALIBRAR CON VIDEO REAL.
+VERDE_V_MIN = 50  # CALIBRAR CON VIDEO REAL.
+
+KERNEL_MORFOLOGICO_SENALES = 5  # Tamaño del kernel de apertura/cierre para las máscaras de color: la apertura quita ruido suelto, el cierre tapa los huecos que dejan las letras blancas de PARE/SIGA dentro del octágono. CALIBRAR CON VIDEO REAL.
+
+# Filtro en cascada de buscar_octagonos(): un contorno debe pasar TODOS
+# estos umbrales para considerarse candidato a octágono. Se aplican en
+# cascada (el más barato de calcular primero) para no gastar approxPolyDP
+# ni momentos en contornos que ya se sabe que no sirven.
+AREA_MINIMA_SENAL_PX = 200  # Contornos más pequeños que esto son ruido de la máscara, no una señal a distancia útil. CALIBRAR CON VIDEO REAL.
+
+VERTICES_OCTAGONO_MIN = 7  # approxPolyDP de un octágono real (con las letras blancas mordiendo el contorno) rara vez da exactamente 8 vértices; se acepta un rango.
+VERTICES_OCTAGONO_MAX = 9
+
+# Extensión: área del contorno sobre área de su boundingRect. Un
+# octágono regular tiene extensión teórica ~0.83 (pierde las esquinas
+# recortadas frente a un cuadrado que lo circunscribe); un círculo da
+# ~0.785 (medido con octágonos/círculos sintéticos: 0.785 exacto para
+# el círculo, 0.80-0.86 para el octágono según cuánto recorte el borde
+# del cuadro). El mínimo se fija en 0.80, por encima del círculo, para
+# que approxPolyDP+vértices no sea el único filtro que los separe.
+EXTENSION_OCTAGONO_MIN = 0.80  # CALIBRAR CON VIDEO REAL.
+EXTENSION_OCTAGONO_MAX = 0.92  # CALIBRAR CON VIDEO REAL.
+
+# Relación de aspecto (ancho/alto del boundingRect) esperada de un
+# octágono regular visto de frente: cercana a 1. Antes se asumía que la
+# señal se veía en perspectiva (más ancha que alta); confirmado que la
+# escena es de frente, así que 1 es válido. Rango con margen para
+# tolerar una ligera inclinación de la cámara.
+ASPECTO_OCTAGONO_MIN = 0.75  # CALIBRAR CON VIDEO REAL.
+ASPECTO_OCTAGONO_MAX = 1.35  # CALIBRAR CON VIDEO REAL.
+
+# Circularidad 4πA/P² (1.0 = círculo perfecto). Un octágono regular da
+# ~0.9; un cuadrado da ~0.785; un círculo (que approxPolyDP con estos
+# vértices ya debería filtrar antes, pero se deja como segunda defensa)
+# da ~1.0. El rango excluye tanto formas muy angulosas (cuadrado,
+# rectángulo) como el círculo.
+CIRCULARIDAD_OCTAGONO_MIN = 0.80  # CALIBRAR CON VIDEO REAL.
+CIRCULARIDAD_OCTAGONO_MAX = 0.97  # CALIBRAR CON VIDEO REAL.
+
+# ConfirmadorSenales: una señal solo se reporta como confirmada si
+# aparece en al menos CONFIRMAR_N de los últimos CONFIRMAR_M fotogramas
+# por color. Evita que un solo fotograma con ruido (o una detección
+# real pero fugaz de un cuadrado de prueba con el color equivocado)
+# dispare una acción del robot.
+CONFIRMAR_M = 5  # CALIBRAR CON VIDEO REAL.
+CONFIRMAR_N = 3  # CALIBRAR CON VIDEO REAL.
+
+# Fracción de la altura de la ROI de señales (0 arriba, 1 en
+# FILA_CHASIS) a partir de la cual se considera que la señal está lo
+# bastante cerca para actuar (en_disparo=True): el centroide de la
+# señal debe estar en fila >= Y_DISPARO * altura_roi_senales.
+Y_DISPARO = 0.7  # CALIBRAR CON VIDEO REAL.
+
+# ==========================================================================
+# CONTROL POR ZONAS
+# ==========================================================================
+#
+# El mBot del docente (ver comunicacion/robot_mbot.py) no acepta
+# velocidades: solo 5 comandos discretos sin parámetros (adelante,
+# atras, izquierda, derecha, parar), cada uno un pulso de duración fija
+# que el firmware autodetiene (100ms avance/retroceso, 30ms giros). No
+# hay forma de pedirle "gira un poco más fuerte": la única "magnitud"
+# de corrección disponible es CUÁNTOS comandos de giro consecutivos se
+# envían antes de volver a avanzar. Por eso el control ya no es un PD
+# continuo (KP/KD/KA no tienen sentido sin una magnitud que multiplicar):
+# es un control por zonas de error, con una relación giro/avance fija
+# por zona.
+#
+# Tres zonas según |error| (normalizado en [-1, 1], igual que siempre):
+# CENTRADO (avanzar sin girar), LEVE (alternar giro/avance) y FUERTE
+# (girar varios comandos seguidos sin avanzar). Dos umbrales separan las
+# tres franjas:
+# |error| < ZONA_CENTRADO              -> centrado
+# ZONA_CENTRADO <= |error| < ZONA_FUERTE -> leve
+# |error| >= ZONA_FUERTE               -> fuerte
+# CALIBRAR CON ROBOT: son estimaciones razonables, deberán ajustarse
+# viendo cuánto se desvía el mBot entre correcciones reales.
+ZONA_CENTRADO = 0.15  # |error| por debajo de este umbral: centrado, se avanza sin girar.
+ZONA_FUERTE = 0.5  # |error| por encima de este umbral: desviación fuerte, se giran varios comandos seguidos sin avanzar. Entre ZONA_CENTRADO y este valor es la zona leve (alterna giro/avance).
+
+# Histéresis entre zonas: al SALIR de una zona hacia una menos severa
+# (p. ej. de FUERTE a LEVE) se exige que |error| baje un margen extra
+# por debajo del umbral de entrada, no que apenas lo cruce. Sin esto,
+# ruido de detección que oscila justo alrededor de un umbral haría que
+# el control alterne de zona (y por lo tanto de plan de giro/avance) en
+# cada fotograma. El suavizado exponencial (ALFA_SUAVIZADO) ya atenúa
+# el ruido de alta frecuencia; esta histéresis es una segunda defensa
+# específica para la frontera entre zonas, que es donde el suavizado
+# solo no basta si el error suavizado se queda oscilando justo ahí.
+# CALIBRAR CON ROBOT.
+MARGEN_HISTERESIS_ZONA = 0.05
+
+GIROS_POR_AVANCE_ZONA_LEVE = 1  # Cuántos comandos de giro se envían antes de volver a avanzar, en zona leve.
+AVANCES_POR_GIRO_ZONA_LEVE = 1  # Cuántos comandos de avance se envían antes de volver a girar, en zona leve (relación 1:1 por defecto).
+GIROS_CONSECUTIVOS_ZONA_FUERTE = 3  # CALIBRAR CON ROBOT. Cuántos comandos de giro seguidos se envían en zona fuerte, sin avanzar entre ellos.
 
 ALFA_SUAVIZADO = 0.4  # Peso del error nuevo en la media exponencial (0-1). Más alto = menos suavizado.
 
-VEL_BASE = 60  # CALIBRAR CON VIDEO. Velocidad de avance en tramo recto, con error y ángulo cercanos a cero.
+# ComandoRobot.izquierda/derecha ya no son velocidades reales (el mBot
+# no las acepta, y el firmware mueve ambos motores del mismo lado a la
+# misma magnitud fija tanto para avanzar como para girar: ver
+# moveForward/turnLeft/turnRight en arduinoFinal.ino). Aquí son valores
+# SIMBÓLICOS que existen solo para que calcular_accion()
+# (control/contratos.py, sin cambios) derive la acción discreta
+# correcta a partir del signo y la diferencia entre ambos:
+# - (SENAL_AVANCE, SENAL_AVANCE) -> diferencia 0 -> AVANZAR.
+# - (SENAL_GIRO, 0) -> diferencia = SENAL_GIRO >= DIF_GIRO, mismo signo
+#   (ninguno es negativo) -> GIRAR_IZQUIERDA.
+# - (0, SENAL_GIRO) -> misma lógica -> GIRAR_DERECHA.
+# SalidaMBot solo mira comando.accion (y, para GIRAR_SOBRE_EJE si
+# llegara a producirse, el signo de comando.izquierda) para decidir
+# qué método de Robot llamar: nunca usa estos números como velocidad.
+VEL_MAX = 100  # Límite simbólico de ComandoRobot.izquierda/derecha, heredado del modelo anterior; ya no corresponde a una velocidad real del mBot.
+SENAL_AVANCE = 60
+SENAL_GIRO = 35
 
-# CALIBRAR CON VIDEO. Velocidad de avance mínima en curvas cerradas
-# (error o ángulo altos). Con 25 quedaba demasiado cerca de
-# ZONA_MUERTA=18 (solo 7 unidades de margen sobre un rango de 100):
-# cualquier giro, aunque fuera pequeño, hacía que una rueda cayera por
-# debajo del umbral y perdiera corrección por completo. 38 deja ~20
-# unidades de margen.
-VEL_MIN = 38
-
-# Límite superior de velocidad para cada rueda, en ambos sentidos: el
-# rango de ComandoRobot.izquierda/derecha es [-VEL_MAX, VEL_MAX] = [-100,
-# 100], NO el PWM 0-255 del Arduino. El compañero de Bluetooth reescala
-# este rango a PWM en su propio código; aquí nunca se habla en unidades
-# de PWM. Si esa reescala cambiara de convención, KP/KD/KA habría que
-# recalibrarlos, porque dependen de esta escala (ver simulador/calibrar_ganancias.py).
-VEL_MAX = 100
-
-VEL_BUSQUEDA = 35  # CALIBRAR CON VIDEO. Velocidad de giro sobre el eje al buscar la línea perdida.
-
-DIF_GIRO = 8  # Diferencia mínima entre ruedas (unidades de velocidad) para considerar que el robot está girando.
+DIF_GIRO = 8  # Diferencia mínima entre ruedas (unidades simbólicas de signo, no de velocidad real) para que calcular_accion() lo reconozca como giro y no como avance recto.
 
 # ==========================================================================
 # SALIDA / COMUNICACIÓN
@@ -66,44 +370,24 @@ DIF_GIRO = 8  # Diferencia mínima entre ruedas (unidades de velocidad) para con
 
 FRECUENCIA_ENVIO = 15  # Frecuencia máxima (Hz) a la que se imprime/envía un ComandoRobot por SalidaConsola.
 
+# Dirección Bluetooth del mBot físico, leída de un .env local (nunca
+# hardcodeada ni versionada: cada integrante prueba con su propio robot).
+# Ver .env.example para el nombre de la variable.
+MAC_MBOT = os.getenv("MAC_MBOT")
+
 # ==========================================================================
 # MÁQUINA DE ESTADOS
 # ==========================================================================
 
 TIEMPO_PARE = 3.0  # Segundos que el robot permanece detenido en el estado PARE.
 TIEMPO_ENFRIAMIENTO = 4.0  # Segundos máximos en REANUDAR ignorando el rojo, incluso si no sale del cuadro.
-TIEMPO_MAX_PERDIDA = 5.0  # Segundos máximos girando en sitio en LINEA_PERDIDA antes de detenerse y reportar.
 
-# Un seguidor de línea real que recupera la línea girando sobre su eje no
-# avanza estando torcido: sigue girando (con avance nulo) hasta quedar
-# alineado, y solo entonces retoma el seguimiento normal. REALINEANDO es
-# ese estado intermedio entre LINEA_PERDIDA y SEGUIR_LINEA.
-#
-# El umbral de alineación se mide sobre 'angulo' (orientación estimada
-# del chasis respecto a la línea), no sobre 'error' (desplazamiento
-# lateral): con avance nulo el robot solo puede corregir su rumbo
-# girando, nunca su posición lateral (eso requiere avanzar, que es
-# justamente lo que hace después SEGUIR_LINEA, ya con el chasis
-# derecho). Usar 'error' como criterio dejaría a REALINEANDO sin salida
-# posible siempre que la posición quedó lejos del centro al perder la
-# línea, porque girar en el sitio nunca la acerca.
-ERROR_REALINEADO = 0.35  # |angulo| por debajo de este umbral se considera "suficientemente alineado" para retomar el seguimiento normal.
-FOTOGRAMAS_REALINEADO_CONSECUTIVOS = 3  # Cuántos fotogramas seguidos con |angulo| < ERROR_REALINEADO se exigen antes de pasar a SEGUIR_LINEA (evita salir por un solo fotograma de ruido).
-
-# Velocidad mínima de giro (en magnitud) que usa realinear() siempre que
-# el ángulo no sea prácticamente cero, igual que VEL_MIN evita que
-# calcular() caiga en zona muerta en curvas suaves. Sin este piso,
-# KP_REALINEACION * angulo da un comando por debajo de ZONA_MUERTA
-# precisamente cuando el ángulo ya es pequeño (la zona donde el robot
-# está a punto de terminar de alinearse): el motor real no reacciona a
-# un comando anulado por zona muerta, así que el chasis queda a merced
-# de la inercia residual del giro de búsqueda anterior, que puede
-# sacarlo del campo de visión de nuevo antes de completar la
-# alineación. Debe superar ZONA_MUERTA con margen.
-# CALIBRAR CON VIDEO.
-VEL_MIN_REALINEACION = 22
-TIEMPO_MAX_REALINEANDO = 2.0  # Segundos máximos intentando alinearse antes de volver a LINEA_PERDIDA (si la línea vuelve a salir del cuadro, no tiene sentido seguir girando despacio ahí mismo).
-KP_REALINEACION = 25.0  # CALIBRAR CON VIDEO. Ganancia proporcional usada solo en REALINEANDO: gira hacia el ángulo, sin componente derivativa, para converger de forma simple y predecible.
+# Segundos máximos buscando la línea en LINEA_PERDIDA antes de
+# detenerse y reportar. No existe un giro sobre el eje (ver
+# control/controlador.py:girar_busqueda): buscar ya desplaza al robot
+# hacia adelante mientras gira, así que este tiempo también acota
+# cuánto puede alejarse buscando antes de rendirse.
+TIEMPO_MAX_PERDIDA = 5.0
 
 # ==========================================================================
 # SIMULACIÓN (simulador/pista_virtual.py) — no afecta al robot real, solo
@@ -142,18 +426,33 @@ PROB_LINEA_INVALIDA = 0.02  # CALIBRAR CON VIDEO. Probabilidad de que un fotogra
 SEMILLA_SIMULACION = 42  # Semilla fija del generador aleatorio, para que las corridas de calibración sean reproducibles.
 
 
-def _cargar_calibracion():
-    """Sobrescribe las constantes de control con valores calibrados desde JSON.
+def _cargar_calibracion_desde(ruta: str) -> None:
+    """Sobrescribe constantes del módulo con valores calibrados desde
+    un archivo JSON, si existe.
 
-    Recibe: nada (lee `RUTA_CALIBRACION_CONTROL` si existe).
+    Recibe: ruta (str, ruta absoluta a un archivo JSON con pares
+        clave/valor; solo se aplican las claves que ya existen como
+        variable de este módulo, para no crear parámetros nuevos por
+        error de tipeo en el JSON).
     Devuelve: nada, modifica las variables del módulo en su lugar.
     Complejidad: O(1), el archivo tiene un puñado de claves.
     """
-    if not os.path.exists(RUTA_CALIBRACION_CONTROL):
+    if not os.path.exists(ruta):
         return
-    with open(RUTA_CALIBRACION_CONTROL, "r", encoding="utf-8") as archivo:
+    with open(ruta, "r", encoding="utf-8") as archivo:
         valores = json.load(archivo)
     globals().update({clave: valores[clave] for clave in valores if clave in globals()})
+
+
+def _cargar_calibracion():
+    """Aplica, en orden, calibracion_control.json y calibracion.json
+    sobre las constantes por defecto de este módulo.
+
+    Recibe: nada. Devuelve: nada.
+    Complejidad: O(1).
+    """
+    _cargar_calibracion_desde(RUTA_CALIBRACION_CONTROL)
+    _cargar_calibracion_desde(RUTA_CALIBRACION_VISION)
 
 
 _cargar_calibracion()

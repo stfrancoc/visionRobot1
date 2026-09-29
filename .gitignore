@@ -12,3 +12,10 @@ venv/
 
 # Calibración local (generada por simulador/visor.py, distinta por máquina)
 calibracion_control.json
+
+# Repositorio del docente, clonado localmente solo como referencia:
+# no es parte de este proyecto y no debe subirse.
+practica-vision-artificial-robotica-main/
+
+# Videos de ensayo: pesan demasiado para el repositorio (ver README.md).
+videos/

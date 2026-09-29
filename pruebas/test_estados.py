@@ -7,7 +7,7 @@ import unittest
 
 import config
 from control.contratos import ResultadoLinea, ResultadoSenales
-from control.estados import DETENIDO, LINEA_PERDIDA, PARE, REALINEANDO, REANUDAR, SEGUIR_LINEA, SIGA, MaquinaEstados
+from control.estados import DETENIDO, LINEA_PERDIDA, PARE, REANUDAR, SEGUIR_LINEA, SIGA, MaquinaEstados
 
 LINEA_OK = ResultadoLinea(error=0.1, angulo=0.0, confianza=4, valida=True)
 LINEA_PERDIDA_RESULTADO = ResultadoLinea(error=0.0, angulo=0.0, confianza=0, valida=False)
@@ -86,26 +86,19 @@ class PruebasMaquinaEstados(unittest.TestCase):
 
         # 8) Se pierde la línea girando hacia el lado correcto: si el
         # último error fue positivo (línea a la derecha), debe girar
-        # hacia la derecha, es decir, con la rueda izquierda más rápida
-        # (misma convención que calcular(): error > 0 -> izquierda > derecha).
+        # hacia la derecha, es decir, con la rueda derecha más rápida
+        # (misma convención que calcular_accion(): derecha > izquierda
+        # -> "GIRAR_DERECHA" -> Robot.derecha()).
         comando = maquina.actualizar(LINEA_PERDIDA_RESULTADO, SIN_SENAL, t)
         t += paso
         self.assertEqual(comando.estado, LINEA_PERDIDA)
         self.assertGreater(LINEA_OK.error, 0)
-        self.assertGreater(comando.izquierda, comando.derecha)
+        self.assertGreater(comando.derecha, comando.izquierda)
 
-        # 9) Se recupera la línea antes del tiempo límite: pasa primero por
-        # REALINEANDO (no avanza estando torcido) y solo llega a
-        # SEGUIR_LINEA tras suficientes fotogramas seguidos ya alineado.
-        comando = maquina.actualizar(LINEA_OK, SIN_SENAL, t)
-        t += paso
-        self.assertEqual(comando.estado, REALINEANDO)
-
-        for _ in range(config.FOTOGRAMAS_REALINEADO_CONSECUTIVOS - 1):
-            comando = maquina.actualizar(LINEA_OK, SIN_SENAL, t)
-            self.assertEqual(comando.estado, REALINEANDO)
-            t += paso
-
+        # 9) Se recupera la línea antes del tiempo límite: no hay estado
+        # intermedio (ya no existe el giro sobre el eje, así que
+        # "realinear sin avanzar" no es una acción física posible): se
+        # retoma el control por zonas de inmediato.
         comando = maquina.actualizar(LINEA_OK, SIN_SENAL, t)
         t += paso
         self.assertEqual(comando.estado, SEGUIR_LINEA)
@@ -125,81 +118,15 @@ class PruebasMaquinaEstados(unittest.TestCase):
         self.assertEqual(comando.estado, DETENIDO)
         self.assertEqual((comando.izquierda, comando.derecha), (0, 0))
 
-    def test_realineando_no_avanza_mientras_el_angulo_es_alto(self):
-        # Al recuperar la línea con el chasis torcido (ángulo alto), la
-        # velocidad de avance debe ser nula: solo gira hacia el ángulo,
-        # no se lanza hacia adelante estando desalineado. El error de
-        # posición puede seguir siendo alto (girando en el sitio no se
-        # corrige): lo que decide la alineación es el ángulo.
+    def test_linea_perdida_busca_con_giro_de_radio_amplio(self):
+        # La búsqueda ya no es un giro sobre el eje: ambas señales de
+        # rueda deben tener el mismo signo (o una en 0), nunca opuestas.
         maquina = self.maquina
-        torcido = ResultadoLinea(error=0.9, angulo=0.9, confianza=4, valida=True)
+        maquina.actualizar(LINEA_OK, SIN_SENAL, tiempo_actual=0.0)  # Fija signo_ultimo_error > 0.
+        comando = maquina.actualizar(LINEA_PERDIDA_RESULTADO, SIN_SENAL, tiempo_actual=0.1)
 
-        maquina.actualizar(LINEA_PERDIDA_RESULTADO, SIN_SENAL, tiempo_actual=0.0)
-        comando = maquina.actualizar(torcido, SIN_SENAL, tiempo_actual=0.1)
-
-        self.assertEqual(comando.estado, REALINEANDO)
-        self.assertEqual(comando.izquierda + comando.derecha, 0)
-        # angulo>0 significa que el chasis ya está girado hacia ese lado:
-        # para deshacerlo hay que girar en sentido contrario (derecha >
-        # izquierda), no reforzarlo como en calcular().
-        self.assertGreater(comando.derecha, comando.izquierda)
-
-    def test_realineando_exige_varios_fotogramas_alineados_antes_de_seguir(self):
-        # Un solo fotograma con ángulo bajo (ruido) no debe bastar para
-        # pasar a SEGUIR_LINEA: se exige una racha de
-        # FOTOGRAMAS_REALINEADO_CONSECUTIVOS fotogramas seguidos.
-        maquina = self.maquina
-        alineado = ResultadoLinea(error=0.9, angulo=0.1, confianza=4, valida=True)
-
-        maquina.actualizar(LINEA_PERDIDA_RESULTADO, SIN_SENAL, tiempo_actual=0.0)
-        # La transición LINEA_PERDIDA -> REALINEANDO (primer fotograma
-        # con ángulo bajo) todavía no cuenta ningún fotograma de la
-        # racha: el conteo empieza en la siguiente llamada, ya dentro
-        # de _en_realineando. Hacen falta FOTOGRAMAS_REALINEADO_CONSECUTIVOS
-        # llamadas más después de esa transición para completar la racha.
-        for i in range(1, config.FOTOGRAMAS_REALINEADO_CONSECUTIVOS + 1):
-            comando = maquina.actualizar(alineado, SIN_SENAL, tiempo_actual=0.1 * i)
-            self.assertEqual(comando.estado, REALINEANDO)
-
-        comando = maquina.actualizar(alineado, SIN_SENAL, tiempo_actual=0.1 * (config.FOTOGRAMAS_REALINEADO_CONSECUTIVOS + 1))
-        self.assertEqual(comando.estado, SEGUIR_LINEA)
-
-    def test_racha_de_alineacion_se_interrumpe_si_el_angulo_vuelve_a_subir(self):
-        maquina = self.maquina
-        alineado = ResultadoLinea(error=0.9, angulo=0.1, confianza=4, valida=True)
-        torcido = ResultadoLinea(error=0.9, angulo=0.9, confianza=4, valida=True)
-
-        maquina.actualizar(LINEA_PERDIDA_RESULTADO, SIN_SENAL, tiempo_actual=0.0)
-        maquina.actualizar(alineado, SIN_SENAL, tiempo_actual=0.1)
-        maquina.actualizar(torcido, SIN_SENAL, tiempo_actual=0.2)  # Rompe la racha.
-
-        for i in range(config.FOTOGRAMAS_REALINEADO_CONSECUTIVOS - 1):
-            comando = maquina.actualizar(alineado, SIN_SENAL, tiempo_actual=0.3 + 0.1 * i)
-            self.assertEqual(comando.estado, REALINEANDO)
-
-    def test_realineando_vuelve_a_linea_perdida_si_se_agota_el_tiempo(self):
-        # Si el ángulo nunca baja del umbral (p. ej. ruido que no
-        # converge), no debe quedarse en REALINEANDO para siempre.
-        maquina = self.maquina
-        torcido = ResultadoLinea(error=0.9, angulo=0.9, confianza=4, valida=True)
-
-        maquina.actualizar(LINEA_PERDIDA_RESULTADO, SIN_SENAL, tiempo_actual=0.0)
-        maquina.actualizar(torcido, SIN_SENAL, tiempo_actual=0.1)
-        self.assertEqual(maquina.estado, REALINEANDO)
-
-        comando = maquina.actualizar(torcido, SIN_SENAL, tiempo_actual=0.1 + config.TIEMPO_MAX_REALINEANDO)
         self.assertEqual(comando.estado, LINEA_PERDIDA)
-
-    def test_realineando_vuelve_a_linea_perdida_si_la_linea_se_pierde_de_nuevo(self):
-        maquina = self.maquina
-        torcido = ResultadoLinea(error=0.9, angulo=0.9, confianza=4, valida=True)
-
-        maquina.actualizar(LINEA_PERDIDA_RESULTADO, SIN_SENAL, tiempo_actual=0.0)
-        maquina.actualizar(torcido, SIN_SENAL, tiempo_actual=0.1)
-        self.assertEqual(maquina.estado, REALINEANDO)
-
-        comando = maquina.actualizar(LINEA_PERDIDA_RESULTADO, SIN_SENAL, tiempo_actual=0.2)
-        self.assertEqual(comando.estado, LINEA_PERDIDA)
+        self.assertFalse(comando.izquierda < 0 < comando.derecha or comando.derecha < 0 < comando.izquierda)
 
     def test_registro_de_eventos_tiene_motivo_y_tiempos_crecientes(self):
         maquina = self.maquina

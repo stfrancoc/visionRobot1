@@ -10,8 +10,9 @@ venv/
 # IDE
 .vscode/
 
-# Calibración local (generada por simulador/visor.py, distinta por máquina)
+# Calibración local (generada por simulador/visor.py y calibrar.py, distinta por máquina)
 calibracion_control.json
+calibracion.json
 
 # Repositorio del docente, clonado localmente solo como referencia:
 # no es parte de este proyecto y no debe subirse.

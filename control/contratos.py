@@ -42,10 +42,19 @@ class ResultadoSenales:
     en_disparo: True si el centroide de la señal cruzó la línea de
         disparo, es decir que la señal ya está lo bastante cerca para
         actuar.
+    candidatos: lista de octágonos detectados en el fotograma actual
+        (antes de la confirmación temporal), cada uno un dict con
+        color, centroide, area, boundingRect y numero_vertices. Sirve
+        para depuración/visualización; el control no debería
+        necesitarlos.
+    mascaras: (mascara_roja, mascara_verde) del fotograma actual, para
+        depuración/visualización.
     """
 
     senal: Optional[str] = None
     en_disparo: bool = False
+    candidatos: list = field(default_factory=list)
+    mascaras: Optional[tuple] = None
 
 
 @dataclass

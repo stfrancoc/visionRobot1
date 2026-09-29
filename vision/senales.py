@@ -1,13 +1,21 @@
-"""Detección de las señales PARE (octágono rojo) y SIGA (octágono
-verde): segmentación por color, búsqueda de octágonos por contornos y
-confirmación temporal para evitar falsos positivos de un solo fotograma.
+"""Detección de las señales PARE (roja) y SIGA (verde): segmentación
+por color, búsqueda de la forma por contornos y confirmación temporal
+para evitar falsos positivos de un solo fotograma.
 
-Calibrado con la imagen de referencia y con octágonos sintéticos, NO
-con videos/correctos/ ni videos/fallos/: esos videos traen cuadrados
-rosados y verdes de ensayos anteriores del equipo, de color y forma
-distintos a la señal real (ver comentario en config.py). Todos los
-rangos HSV y umbrales de forma quedan marcados "CALIBRAR CON VIDEO
-REAL" para cuando existan señales definitivas.
+Las señales definitivas son OCTÁGONOS rojo (PARE) y verde (SIGA) con
+texto blanco y borde oscuro. Los umbrales de forma se calibraron
+midiendo la imagen de referencia entregada por el equipo: 8 vértices,
+extensión 0.824-0.826 (el valor teórico de un octágono regular es
+0.828), aspecto 1.00 y circularidad 0.910.
+
+El texto blanco abre huecos dentro de la máscara de color; el cierre
+morfológico de mascaras_color() los tapa para que findContours vea un
+octágono lleno y no un anillo.
+
+Los rangos HSV siguen marcados "CALIBRAR CON VIDEO REAL" en
+config.py: se fijaron con colores sintéticos y conviene afinarlos con
+calibrar.py sobre la pista real, porque la iluminación del salón
+cambia el matiz que ve la cámara.
 
 Nota sobre un modo de falla conocido y NO corregido aquí a propósito:
 cuando la señal PARE tapa la línea, buscar_octagonos() puede fallar
@@ -94,9 +102,13 @@ def mascaras_color(roi_hsv: np.ndarray, cfg=config) -> tuple[np.ndarray, np.ndar
 
 
 def buscar_octagonos(mascara: np.ndarray, color: str, cfg=config) -> list[dict]:
-    """Busca contornos con forma de octágono regular en una máscara de
-    color, filtrando en cascada por área, número de vértices,
-    extensión, relación de aspecto y circularidad.
+    """Busca contornos con la forma de la señal (rombo/rectángulo) en
+    una máscara de color, filtrando en cascada por área, número de
+    vértices, extensión, relación de aspecto y circularidad.
+
+    El nombre conserva "octagonos" por compatibilidad con el resto del
+    código y las pruebas; la forma que realmente busca es la de las
+    señales de la pista (ver el docstring del módulo), no un octágono.
 
     El filtrado en cascada evita calcular approxPolyDP/momentos sobre
     contornos que ya se descartaron por un criterio más barato (área).
@@ -123,7 +135,7 @@ def buscar_octagonos(mascara: np.ndarray, color: str, cfg=config) -> list[dict]:
         perimetro = cv2.arcLength(contorno, True)
         aproximado = cv2.approxPolyDP(contorno, 0.02 * perimetro, True)
         numero_vertices = len(aproximado)
-        if not (cfg.VERTICES_OCTAGONO_MIN <= numero_vertices <= cfg.VERTICES_OCTAGONO_MAX):
+        if not (cfg.VERTICES_SENAL_MIN <= numero_vertices <= cfg.VERTICES_SENAL_MAX):
             continue
 
         x, y, ancho, alto = cv2.boundingRect(contorno)
@@ -132,17 +144,17 @@ def buscar_octagonos(mascara: np.ndarray, color: str, cfg=config) -> list[dict]:
             continue
 
         extension = area / area_rect
-        if not (cfg.EXTENSION_OCTAGONO_MIN <= extension <= cfg.EXTENSION_OCTAGONO_MAX):
+        if not (cfg.EXTENSION_SENAL_MIN <= extension <= cfg.EXTENSION_SENAL_MAX):
             continue
 
         aspecto = ancho / alto
-        if not (cfg.ASPECTO_OCTAGONO_MIN <= aspecto <= cfg.ASPECTO_OCTAGONO_MAX):
+        if not (cfg.ASPECTO_SENAL_MIN <= aspecto <= cfg.ASPECTO_SENAL_MAX):
             continue
 
         if perimetro == 0:
             continue
         circularidad = 4 * np.pi * area / (perimetro ** 2)
-        if not (cfg.CIRCULARIDAD_OCTAGONO_MIN <= circularidad <= cfg.CIRCULARIDAD_OCTAGONO_MAX):
+        if not (cfg.CIRCULARIDAD_SENAL_MIN <= circularidad <= cfg.CIRCULARIDAD_SENAL_MAX):
             continue
 
         momentos = cv2.moments(contorno)

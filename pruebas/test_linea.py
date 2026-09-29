@@ -179,6 +179,30 @@ class PruebasDeteccionLinea(unittest.TestCase):
         self.assertFalse(resultado.valida)
         self.assertEqual(resultado.confianza, 0)
 
+    def test_borde_de_mesa_oscuro_no_se_confunde_con_la_linea(self):
+        # Escena real de las grabaciones test1-test4: la pista blanca
+        # está sobre una mesa de madera más oscura que la pista pero
+        # más clara que la línea. Son TRES poblaciones de gris, y con
+        # K-Means de 2 grupos la madera se agrupaba con la línea: la
+        # máscara pasaba de ~15% a ~46% de blanco y el robot seguía el
+        # borde de la mesa hasta salirse de la pista.
+        roi = np.full((ALTO, ANCHO, 3), GRIS_PISO, dtype=np.uint8)
+        roi[:, int(ANCHO * 0.70):] = 110  # madera del borde, tono intermedio
+        centro = ANCHO // 4
+        roi[:, centro - ANCHO_LINEA // 2:centro + ANCHO_LINEA // 2] = GRIS_LINEA
+
+        resultado, mascara = detectar_linea(roi, self.estado, config)
+
+        self.assertTrue(resultado.valida)
+        # La madera NO debe quedar marcada como línea.
+        columna_madera = mascara[:, int(ANCHO * 0.75):]
+        self.assertLess((columna_madera > 0).mean(), 0.1)
+        # La línea real SÍ debe quedar marcada.
+        columna_linea = mascara[:, centro - ANCHO_LINEA // 4:centro + ANCHO_LINEA // 4]
+        self.assertGreater((columna_linea > 0).mean(), 0.8)
+        # Y el error debe apuntar a la izquierda, donde está la línea.
+        self.assertLess(resultado.error, 0)
+
     def test_mascara_linea_es_binaria_y_marca_la_linea(self):
         roi = _roi_linea_recta(ANCHO // 2)
         mascara = mascara_linea(roi, umbral=125.0, cfg=config)

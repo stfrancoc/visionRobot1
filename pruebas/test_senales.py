@@ -1,11 +1,12 @@
 """Pruebas de detección de señales (vision/senales.py) con imágenes
 sintéticas generadas con NumPy/OpenCV: octágonos rojo y verde dibujados
-con fillPoly, y formas que deben rechazarse (rectángulo, círculo).
+con fillPoly (la forma real de las señales de la pista), y formas que
+deben rechazarse (franja transversal muy alargada, círculo).
 
-No se usan los videos de ensayo para estas pruebas: como se explica en
-config.py, los cuadrados rosados/verdes que traen son de pruebas
-anteriores del equipo y no representan la señal real (octágono con
-PARE/SIGA en blanco sobre rojo o verde).
+La forma sintética es un octágono porque es lo que se midió en la
+imagen de referencia de las señales definitivas: 8 vértices, extensión
+0.824-0.826, aspecto 1.00, circularidad 0.910 — un octágono regular
+(ver el docstring de vision/senales.py).
 """
 
 import unittest
@@ -26,7 +27,8 @@ ROSADO_BGR = (180, 140, 230)  # Matiz distinto al rojo de la señal: no debe pas
 
 
 def _vertices_octagono(centro: tuple[int, int], radio: int) -> np.ndarray:
-    """Genera los 8 vértices de un octágono regular.
+    """Genera los 8 vértices de un octágono regular (la forma real de
+    la señal).
 
     Recibe: centro (x, y) y radio (px, del centro a cada vértice).
     Devuelve: array (8, 2) int32, listo para cv2.fillPoly.
@@ -43,9 +45,11 @@ def _vertices_octagono(centro: tuple[int, int], radio: int) -> np.ndarray:
 def _imagen_con_octagono(color_bgr, centro=(150, 150), radio=60, con_texto=False) -> np.ndarray:
     """Construye una imagen BGR sintética con un octágono relleno.
 
-    Recibe: color_bgr (tupla BGR del octágono), centro, radio y
-        con_texto (si True, dibuja "PARE" en blanco encima, simulando
-        el texto real dentro de la señal).
+    Recibe: color_bgr (tupla BGR de la señal), centro, radio y
+        con_texto (si True, dibuja "PARE" en blanco encima, como el
+        texto que llevan las señales reales: el cierre morfológico de
+        mascaras_color() debe tapar esos huecos para que el contorno
+        siga siendo un octágono).
     Devuelve: imagen BGR (ALTO, ANCHO, 3).
     """
     imagen = np.full((ALTO, ANCHO, 3), GRIS_FONDO, dtype=np.uint8)
@@ -63,7 +67,8 @@ def _imagen_con_octagono(color_bgr, centro=(150, 150), radio=60, con_texto=False
 
 def _imagen_con_rectangulo(color_bgr, centro=(150, 150), medio_ancho=60, medio_alto=40) -> np.ndarray:
     """Construye una imagen BGR sintética con un rectángulo relleno del
-    color dado (debe rechazarse: ni vértices ni extensión de octágono).
+    color dado (debe rechazarse: un rectángulo no es un octágono, y
+    falla por vértices, extensión y circularidad).
     """
     imagen = np.full((ALTO, ANCHO, 3), GRIS_FONDO, dtype=np.uint8)
     x, y = centro
@@ -75,10 +80,20 @@ def _imagen_con_rectangulo(color_bgr, centro=(150, 150), medio_ancho=60, medio_a
     return imagen
 
 
+def _imagen_con_franja_transversal(color_bgr, fila=150, grosor=35) -> np.ndarray:
+    """Construye una imagen BGR sintética con una franja que cruza todo
+    el ancho del cuadro (debe rechazarse: su relación de aspecto es muy
+    superior a ASPECTO_SENAL_MAX).
+    """
+    imagen = np.full((ALTO, ANCHO, 3), GRIS_FONDO, dtype=np.uint8)
+    cv2.rectangle(imagen, (0, fila - grosor // 2), (ANCHO - 1, fila + grosor // 2), color_bgr, -1)
+    return imagen
+
+
 def _imagen_con_circulo(color_bgr, centro=(150, 150), radio=60) -> np.ndarray:
     """Construye una imagen BGR sintética con un círculo relleno del
-    color dado (debe rechazarse: approxPolyDP le da muchos más
-    vértices que un octágono).
+    color dado (debe rechazarse: approxPolyDP le da más vértices que
+    una señal, y su circularidad supera CIRCULARIDAD_SENAL_MAX).
     """
     imagen = np.full((ALTO, ANCHO, 3), GRIS_FONDO, dtype=np.uint8)
     cv2.circle(imagen, centro, radio, color_bgr, -1)
@@ -128,7 +143,21 @@ class PruebasBuscarOctagonos(unittest.TestCase):
         self.assertEqual(candidatos[0]["color"], "SIGA")
 
     def test_rectangulo_rojo_se_rechaza(self):
+        # Las señales son octágonos: un rectángulo del mismo color
+        # (p. ej. un objeto rojo cualquiera en la escena) debe
+        # descartarse por vértices, extensión y circularidad.
         imagen = _imagen_con_rectangulo(ROJO_BGR)
+        hsv = cv2.cvtColor(imagen, cv2.COLOR_BGR2HSV)
+        mascara_roja, _ = mascaras_color(hsv, config)
+        candidatos = buscar_octagonos(mascara_roja, "PARE", config)
+        self.assertEqual(candidatos, [])
+
+    def test_franja_transversal_se_rechaza_por_aspecto(self):
+        # La franja sobre la que van montadas las señales cruza todo el
+        # ancho del cuadro: su relación de aspecto supera con creces
+        # ASPECTO_SENAL_MAX y debe descartarse aunque sea del color de
+        # una señal.
+        imagen = _imagen_con_franja_transversal(ROJO_BGR)
         hsv = cv2.cvtColor(imagen, cv2.COLOR_BGR2HSV)
         mascara_roja, _ = mascaras_color(hsv, config)
         candidatos = buscar_octagonos(mascara_roja, "PARE", config)

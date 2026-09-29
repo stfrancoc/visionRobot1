@@ -187,10 +187,16 @@ def _crear_salida(nombre_salida: str):
         # Import diferido: comunicacion.salida_mbot solo se necesita
         # (y solo debería fallar si falta pybluez/el robot) cuando de
         # verdad se pide --salida mbot.
+        from comunicacion.salida_asincrona import SalidaAsincrona
         from comunicacion.salida_mbot import SalidaMBot
         salida = SalidaMBot()
         salida.conectar()
-        return salida
+        # Envuelta en SalidaAsincrona porque cada envío por Bluetooth
+        # bloquea ~100ms (time.sleep del Robot del docente) y eso
+        # arrastraba el ciclo de visión completo de ~59 a ~9 FPS. Solo
+        # la salida al robot real se envuelve: consola y nula no
+        # bloquean.
+        return SalidaAsincrona(salida)
     raise ValueError(f"--salida debe ser consola, nula o mbot, no {nombre_salida!r}")
 
 

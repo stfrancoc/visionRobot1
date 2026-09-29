@@ -54,8 +54,13 @@ ESPERA_REINTENTO_LECTOR_MS = 20
 # píxeles). Valores válidos: 0 (sin rotación), 90, 180, 270 (grados en
 # sentido horario). CALIBRAR CON VIDEO: depende del teléfono y del
 # backend de video de cada máquina, se verifica con
-# pruebas/probar_captura_preprocesamiento.py.
-ROTACION = 0
+# pruebas/probar_captura_preprocesamiento.py o main.py --etapa vision.
+#
+# Cambiado a 90 tras montar el teléfono en el nuevo soporte vertical
+# (más estable que el soporte horizontal anterior): con DroidCam el
+# stream llega acostado. Si con 90 la imagen queda al revés (girada
+# hacia el lado contrario), cambiar a 270.
+ROTACION = 90
 
 ANCHO_PROCESO = 480  # Ancho (px) al que se redimensiona el fotograma para el resto del pipeline, manteniendo la proporción original. Bajarlo acelera todo el procesamiento; subirlo da más detalle a costa de latencia.
 
@@ -104,7 +109,21 @@ ROI_SENALES_FIN = 0.6  # Fracción de la altura disponible donde termina la ROI 
 # VISIÓN — UMBRAL ADAPTATIVO (vision/umbral_kmeans.py)
 # ==========================================================================
 
-TAMANO_MUESTRA_KMEANS = 500  # Cuántos píxeles de la ROI se muestrean al azar para ajustar K-Means: no hace falta usar todos los píxeles para separar dos grupos bien distintos (línea/piso).
+TAMANO_MUESTRA_KMEANS = 500  # Cuántos píxeles de la ROI se muestrean al azar para ajustar K-Means: no hace falta usar todos los píxeles para separar grupos de gris bien distintos.
+
+# En cuántos grupos de nivel de gris divide K-Means los píxeles de la
+# ROI. Es 3, no 2, porque la escena real tiene TRES poblaciones: pista
+# blanca (~220), línea negra (~35) y la madera del borde de la mesa que
+# rodea la pista (~100-150). Con K=2, en cuanto la madera ocupa
+# suficiente área, K-Means la agrupa con la línea: medido sobre las
+# grabaciones test1-test4, el umbral saltaba de ~118 a ~163 y la
+# máscara de línea pasaba de ~15% a ~46% de píxeles blancos, con el
+# robot siguiendo el borde de la pista en vez de la línea hasta
+# salirse. Con 3 grupos el umbral se toma entre el centroide más
+# oscuro (línea) y el intermedio (madera), dejando fuera a ambas.
+# CALIBRAR CON VIDEO: si la pista se monta sobre una superficie de un
+# solo tono (sin borde de madera visible), 2 vuelve a ser suficiente.
+KMEANS_GRUPOS = 3
 
 # Cuántas veces corre K-Means con centroides iniciales distintos, se
 # queda con el mejor. Es el parámetro que más determina el costo de
@@ -256,34 +275,47 @@ KERNEL_MORFOLOGICO_SENALES = 5  # Tamaño del kernel de apertura/cierre para las
 # ni momentos en contornos que ya se sabe que no sirven.
 AREA_MINIMA_SENAL_PX = 200  # Contornos más pequeños que esto son ruido de la máscara, no una señal a distancia útil. CALIBRAR CON VIDEO REAL.
 
-VERTICES_OCTAGONO_MIN = 7  # approxPolyDP de un octágono real (con las letras blancas mordiendo el contorno) rara vez da exactamente 8 vértices; se acepta un rango.
-VERTICES_OCTAGONO_MAX = 9
+# Número de vértices que approxPolyDP debe encontrar en el contorno.
+# Las señales definitivas son OCTÁGONOS rojo (PARE) y verde (SIGA) con
+# texto blanco y borde oscuro: medidos sobre la imagen de referencia
+# (capturas/_ref_senales.png) dan exactamente 8 vértices. El rango
+# 6-9 tolera la degradación en video real: a distancia, con desenfoque
+# de movimiento o parcialmente tapado, approxPolyDP puede colapsar un
+# par de lados (6-7) o añadir uno espurio (9).
+VERTICES_SENAL_MIN = 6
+VERTICES_SENAL_MAX = 9
 
 # Extensión: área del contorno sobre área de su boundingRect. Un
-# octágono regular tiene extensión teórica ~0.83 (pierde las esquinas
-# recortadas frente a un cuadrado que lo circunscribe); un círculo da
-# ~0.785 (medido con octágonos/círculos sintéticos: 0.785 exacto para
-# el círculo, 0.80-0.86 para el octágono según cuánto recorte el borde
-# del cuadro). El mínimo se fija en 0.80, por encima del círculo, para
-# que approxPolyDP+vértices no sea el único filtro que los separe.
-EXTENSION_OCTAGONO_MIN = 0.80  # CALIBRAR CON VIDEO REAL.
-EXTENSION_OCTAGONO_MAX = 0.92  # CALIBRAR CON VIDEO REAL.
+# octágono regular tiene extensión teórica 0.828 (pierde las cuatro
+# esquinas frente al cuadrado que lo circunscribe); medido sobre la
+# imagen de referencia da 0.824-0.826, clavado en el valor teórico.
+# El rango 0.79-0.92 deja fuera al círculo por abajo y al
+# cuadrado/rectángulo lleno (1.0) por arriba. El mínimo está ajustado
+# a propósito justo encima de 0.785, la extensión de un círculo: es el
+# ÚNICO discriminante fiable contra un círculo del color de una señal,
+# porque approxPolyDP le da también 8 vértices y su circularidad
+# (0.907) se solapa con la del octágono (0.948). Medido con formas
+# sintéticas: círculo 0.785, octágono 0.809-0.826.
+EXTENSION_SENAL_MIN = 0.79  # CALIBRAR CON VIDEO REAL.
+EXTENSION_SENAL_MAX = 0.92  # CALIBRAR CON VIDEO REAL.
 
-# Relación de aspecto (ancho/alto del boundingRect) esperada de un
-# octágono regular visto de frente: cercana a 1. Antes se asumía que la
-# señal se veía en perspectiva (más ancha que alta); confirmado que la
-# escena es de frente, así que 1 es válido. Rango con margen para
-# tolerar una ligera inclinación de la cámara.
-ASPECTO_OCTAGONO_MIN = 0.75  # CALIBRAR CON VIDEO REAL.
-ASPECTO_OCTAGONO_MAX = 1.35  # CALIBRAR CON VIDEO REAL.
+# Relación de aspecto (ancho/alto del boundingRect). Un octágono
+# regular visto de frente da 1.0 (medido en la referencia: 1.000-1.002).
+# El rango 0.65-1.55 tolera el escorzo cuando la cámara mira la señal
+# en ángulo y el recorte parcial por el borde del cuadro, y sigue
+# descartando con holgura la franja transversal sobre la que van
+# montadas las señales (aspecto de 6 a 16 medido en los videos).
+ASPECTO_SENAL_MIN = 0.65  # CALIBRAR CON VIDEO REAL.
+ASPECTO_SENAL_MAX = 1.55  # CALIBRAR CON VIDEO REAL.
 
 # Circularidad 4πA/P² (1.0 = círculo perfecto). Un octágono regular da
-# ~0.9; un cuadrado da ~0.785; un círculo (que approxPolyDP con estos
-# vértices ya debería filtrar antes, pero se deja como segunda defensa)
-# da ~1.0. El rango excluye tanto formas muy angulosas (cuadrado,
-# rectángulo) como el círculo.
-CIRCULARIDAD_OCTAGONO_MIN = 0.80  # CALIBRAR CON VIDEO REAL.
-CIRCULARIDAD_OCTAGONO_MAX = 0.97  # CALIBRAR CON VIDEO REAL.
+# ~0.906 teórico; medido en la referencia: 0.910-0.912. Un cuadrado da
+# 0.785 y un círculo ~1.0. El rango 0.82-0.97 deja fuera al cuadrado
+# por abajo, y por arriba no llega a 1.0 para que un círculo del color
+# de una señal no pase. La franja transversal y el ruido, con
+# perímetro largo y poca área, caen muy por debajo de 0.82.
+CIRCULARIDAD_SENAL_MIN = 0.82  # CALIBRAR CON VIDEO REAL.
+CIRCULARIDAD_SENAL_MAX = 0.97  # CALIBRAR CON VIDEO REAL.
 
 # ConfirmadorSenales: una señal solo se reporta como confirmada si
 # aparece en al menos CONFIRMAR_N de los últimos CONFIRMAR_M fotogramas
@@ -324,7 +356,16 @@ Y_DISPARO = 0.7  # CALIBRAR CON VIDEO REAL.
 # CALIBRAR CON ROBOT: son estimaciones razonables, deberán ajustarse
 # viendo cuánto se desvía el mBot entre correcciones reales.
 ZONA_CENTRADO = 0.15  # |error| por debajo de este umbral: centrado, se avanza sin girar.
-ZONA_FUERTE = 0.5  # |error| por encima de este umbral: desviación fuerte, se giran varios comandos seguidos sin avanzar. Entre ZONA_CENTRADO y este valor es la zona leve (alterna giro/avance).
+# |error| por encima de este umbral: desviación fuerte, se giran varios
+# comandos seguidos sin avanzar. Entre ZONA_CENTRADO y este valor es la
+# zona leve (alterna giro/avance).
+# Bajado de 0.5 a 0.38: con 0.5 la línea tenía que estar a media
+# anchura del cuadro del centro antes de que el control reaccionara en
+# serio, y en una curva cerrada para entonces el robot ya venía
+# demasiado abierto para recuperarla. Entrando antes en zona fuerte la
+# corrección empieza mientras la curva todavía se puede tomar.
+# CALIBRAR CON ROBOT.
+ZONA_FUERTE = 0.38
 
 # Histéresis entre zonas: al SALIR de una zona hacia una menos severa
 # (p. ej. de FUERTE a LEVE) se exige que |error| baje un margen extra
@@ -340,7 +381,19 @@ MARGEN_HISTERESIS_ZONA = 0.05
 
 GIROS_POR_AVANCE_ZONA_LEVE = 1  # Cuántos comandos de giro se envían antes de volver a avanzar, en zona leve.
 AVANCES_POR_GIRO_ZONA_LEVE = 1  # Cuántos comandos de avance se envían antes de volver a girar, en zona leve (relación 1:1 por defecto).
-GIROS_CONSECUTIVOS_ZONA_FUERTE = 3  # CALIBRAR CON ROBOT. Cuántos comandos de giro seguidos se envían en zona fuerte, sin avanzar entre ellos.
+# Cuántos comandos de giro seguidos se envían en zona fuerte antes de
+# intercalar un avance.
+#
+# OJO al contar comandos en vez de tiempo: un pulso de avance dura
+# 100ms y uno de giro 30ms, así que un ciclo de 3 giros + 1 avance
+# deja al robot 90ms girando contra 100ms avanzando — pasaba MÁS
+# tiempo avanzando que girando justo en la zona pensada para corregir
+# fuerte, y por eso se pasaba de largo en las curvas cerradas. Con 5
+# el reparto queda en 150ms girando contra 100ms avanzando (60%
+# girando), que es lo que se espera de esta zona.
+# CALIBRAR CON ROBOT: subir a 7 (68% girando) si aún se abre en las
+# curvas cerradas; bajar si empieza a sobre-corregir y zigzaguear.
+GIROS_CONSECUTIVOS_ZONA_FUERTE = 5
 
 ALFA_SUAVIZADO = 0.4  # Peso del error nuevo en la media exponencial (0-1). Más alto = menos suavizado.
 
@@ -368,7 +421,30 @@ DIF_GIRO = 8  # Diferencia mínima entre ruedas (unidades simbólicas de signo, 
 # SALIDA / COMUNICACIÓN
 # ==========================================================================
 
-FRECUENCIA_ENVIO = 15  # Frecuencia máxima (Hz) a la que se imprime/envía un ComandoRobot por SalidaConsola.
+# Frecuencia máxima (Hz) a la que se envía un ComandoRobot al robot.
+#
+# ES EL ÚNICO CONTROL DE VELOCIDAD QUE EXISTE. El firmware no acepta
+# magnitudes: cada comando es un pulso de duración fija que se
+# autodetiene (100ms avanzando, 30ms girando). La velocidad efectiva
+# del robot es entonces el ciclo de trabajo = duración del pulso /
+# periodo de envío. Ni SENAL_AVANCE ni SENAL_GIRO influyen: son
+# símbolos para calcular_accion(), no velocidades.
+#
+# A 15 Hz (periodo 66.7ms) el pulso de avance de 100ms NUNCA alcanza a
+# expirar antes del siguiente: el robot avanzaba de forma continua a
+# velocidad máxima, sin poder tomar las curvas. A 8 Hz (periodo 125ms)
+# quedan 25ms de pausa entre pulsos de avance, ~80% de ciclo de
+# trabajo, y el robot avanza más despacio dando tiempo a que la
+# corrección de rumbo surta efecto antes de seguir adelante.
+#
+# CALIBRAR CON ROBOT: si aún va rápido para las curvas, bajar a 6 Hz
+# (66ms de pausa, ~60% de ciclo) o 5 Hz (100ms, 50%). Si se vuelve
+# demasiado lento o entrecortado, subir hacia 10 Hz (avance continuo
+# justo en el límite, sin pausa). Ojo: bajar esta frecuencia también
+# espacia los comandos de GIRO, que ya tienen pausa a cualquier valor
+# por debajo de 33 Hz; si el problema pasa a ser que gira poco, la
+# palanca es GIROS_CONSECUTIVOS_ZONA_FUERTE, no esta.
+FRECUENCIA_ENVIO = 8
 
 # Dirección Bluetooth del mBot físico, leída de un .env local (nunca
 # hardcodeada ni versionada: cada integrante prueba con su propio robot).

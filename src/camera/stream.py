@@ -1,3 +1,4 @@
+import threading
 import time
 from typing import Optional
 
@@ -8,22 +9,33 @@ from src.config import settings
 
 
 class CameraStream:
-    """Wrapper para conectar con flujos de cámara IP o MJPEG desde celular."""
+    """Lee cámara, stream IP o archivo de vídeo en un hilo de captura."""
 
     def __init__(self, url: Optional[str] = None, width: int = None, height: int = None):
-        self.url = url or settings.CAMERA_URL
+        self.url = settings.CAMERA_URL if url is None else url
+        if isinstance(self.url, str) and self.url.isdigit():
+            self.url = int(self.url)
         self.width = width or settings.CAPTURE_WIDTH
         self.height = height or settings.CAPTURE_HEIGHT
         self.capture = None
         self._connected = False
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._frame_id = 0
+        self.source = None
 
     def connect(self) -> bool:
-        """Abre la conexión con la cámara IP o usa una cámara local como fallback."""
+        """Abre la fuente y comienza a conservar únicamente el frame más reciente."""
         self.capture = cv2.VideoCapture(self.url)
 
         if not self.capture.isOpened():
             print(f"[Camera] No se pudo abrir la URL: {self.url}")
-            print("[Camera] Intentando fallback a la cámara local (device 0)...")
+            if isinstance(self.url, str) and self.url.lower().startswith(("http://", "https://", "rtsp://")):
+                print("[Camera] Intentando fallback a la cámara local (device 0)...")
+            else:
+                return False
             self.capture = cv2.VideoCapture(0)
 
         if not self.capture.isOpened():
@@ -33,26 +45,40 @@ class CameraStream:
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._connected = True
-
-        source = self.url if self.capture.get(cv2.CAP_PROP_FRAME_COUNT) == -1 else "Cámara local (fallback)"
-        print(f"[Camera] Conectado a: {source}")
+        self.source = self.url if isinstance(self.url, str) else "Cámara local"
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._capture_loop, name="camera-capture", daemon=True)
+        self._thread.start()
+        print(f"[Camera] Captura iniciada: {self.source}")
         return True
 
+    def _capture_loop(self):
+        while not self._stop_event.is_set():
+            ok, frame = self.capture.read()
+            if not ok or frame is None:
+                if self.capture.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
+                    self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                time.sleep(0.01)
+                continue
+            with self._frame_lock:
+                self._latest_frame = frame
+                self._frame_id += 1
+
     def read_frame(self) -> Optional[np.ndarray]:
-        """Lee un frame del stream. Devuelve None si no hay contenido."""
-        if self.capture is None:
-            return None
-
-        ok, frame = self.capture.read()
-        if not ok or frame is None:
-            return None
-
-        return frame
+        """Devuelve una copia del último frame disponible sin bloquear la captura."""
+        with self._frame_lock:
+            return None if self._latest_frame is None else self._latest_frame.copy()
 
     def close(self):
         """Cierra la conexión con la cámara."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
         if self.capture is not None:
             self.capture.release()
+        with self._frame_lock:
+            self._latest_frame = None
         self._connected = False
         print("[Camera] Conexión cerrada.")
 

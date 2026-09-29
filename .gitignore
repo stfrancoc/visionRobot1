@@ -6,6 +6,9 @@ venv/
 
 # Local env
 .env
+calibration.json
+phone-camera-cert.pem
+phone-camera-key.pem
 
 # IDE
 .vscode/

@@ -18,16 +18,24 @@ class CameraStream:
         self._connected = False
 
     def connect(self) -> bool:
-        """Abre la conexión con la cámara IP."""
+        """Abre la conexión con la cámara IP o usa una cámara local como fallback."""
         self.capture = cv2.VideoCapture(self.url)
+
         if not self.capture.isOpened():
             print(f"[Camera] No se pudo abrir la URL: {self.url}")
+            print("[Camera] Intentando fallback a la cámara local (device 0)...")
+            self.capture = cv2.VideoCapture(0)
+
+        if not self.capture.isOpened():
+            print(f"[Camera] Tampoco se pudo abrir la cámara local. Verifica la URL o la cámara del PC.")
             return False
 
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._connected = True
-        print(f"[Camera] Conectado a: {self.url}")
+
+        source = self.url if self.capture.get(cv2.CAP_PROP_FRAME_COUNT) == -1 else "Cámara local (fallback)"
+        print(f"[Camera] Conectado a: {source}")
         return True
 
     def read_frame(self) -> Optional[np.ndarray]:
